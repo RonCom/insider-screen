@@ -22,6 +22,7 @@ def _transport(replies):
     def handler(request):
         body = json.loads(request.content)
         assert body["format"]["title"] == "ReleaseExtraction"
+        assert body["options"]["num_ctx"] == extract.NUM_CTX
         return httpx.Response(200, json={"message": {"content": next(it)}})
     return httpx.MockTransport(handler)
 

@@ -25,6 +25,8 @@ from pydantic import BaseModel, Field, ValidationError
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:14b")
 GATE = 0.90  # spec: >= 90% accuracy on issuer and announcement date
+NUM_CTX = 8192  # 12,000 chars of release (~3k tokens) + prompt + schema can pass Ollama's 4,096 default,
+# and Ollama drops the start of an overlong prompt (the instructions) without an error
 
 
 class TradedEvent(BaseModel):
@@ -60,7 +62,7 @@ def call_ollama(text: str, model: str, client: httpx.Client) -> ReleaseExtractio
         "model": model,
         "stream": False,
         "format": ReleaseExtraction.model_json_schema(),
-        "options": {"temperature": 0},
+        "options": {"temperature": 0, "num_ctx": NUM_CTX},
         "messages": [
             {"role": "system", "content": SYSTEM},
             {"role": "user", "content": text[:12000]},
