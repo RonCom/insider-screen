@@ -50,8 +50,9 @@ class PoliteClient:
                 time.sleep(self.min_interval - gap)
             self._last = time.monotonic()
 
-    def get(self, url: str, use_cache: bool = True) -> tuple[int, bytes]:
-        """Return (status, body). 404s are cached as empty bodies so reruns skip them."""
+    def get(self, url: str, use_cache: bool = True, store: bool = True) -> tuple[int, bytes]:
+        """Return (status, body). 404s are cached as empty bodies so reruns skip them.
+        store=False skips writing large bodies to the cache (the 404 marker is still written)."""
         path = self._cache_path(url)
         miss = path.with_suffix(".404")
         if use_cache and path.exists():
@@ -76,7 +77,7 @@ class PoliteClient:
 
         if resp.status_code == 403 and "x-deny-reason" in resp.headers:
             raise RuntimeError(f"Blocked by local proxy ({resp.headers['x-deny-reason']}): {url}")
-        if resp.status_code == 200:
+        if resp.status_code == 200 and store:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(resp.content)
         elif resp.status_code == 404:
