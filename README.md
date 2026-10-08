@@ -17,8 +17,8 @@ uv run pytest
 uv run python -m insider_screen.sec_releases --since 2016-01-01
 
 # 2. Extract traded events from insider-trading candidates with a local model (Ollama running)
-uv run python -m insider_screen.extract run --model qwen2.5:14b --limit 20   # check a few first
-uv run python -m insider_screen.extract run --model qwen2.5:14b
+uv run python -m insider_screen.extract run --model gemma4:26b --limit 20   # check a few first
+uv run python -m insider_screen.extract run --model gemma4:26b
 
 # 3. Hand-check 100 releases: fill the ok_* columns with Y or N, then score (gate: 0.90 on issuer and date)
 uv run python -m insider_screen.extract sample
@@ -46,7 +46,7 @@ uv run python -m insider_screen.edgar events
 ## Labels matched to events
 
 ```powershell
-uv run python -m insider_screen.match --model qwen2.5:14b
+uv run python -m insider_screen.match --model gemma4:26b
 ```
 
 Writes `labels.release_event_matches` (one row per extracted event, with a reason when unmatched) and the view `labels.charged_events`.

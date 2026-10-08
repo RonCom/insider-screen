@@ -53,9 +53,8 @@ def parse_daily(text: str) -> pd.DataFrame:
     if not lines:
         return pd.DataFrame(columns=["date", "symbol", "short_volume", "short_exempt_volume", "total_volume"])
     header = [h.strip().lower().replace(" ", "") for h in lines[0].split("|")]
-    missing = {"date", "symbol", "shortvolume", "totalvolume"} - set(header)
-    if missing:  # checked before the empty case so an error page isn't read as a quiet day
-        raise ValueError(f"missing columns {sorted(missing)}; first line: {lines[0][:200]!r}")
+    if not {"date", "symbol", "shortvolume", "totalvolume"} <= set(header):
+        raise ValueError(f"unexpected header; first line: {lines[0][:200]!r}")
     rows = [ln.split("|") for ln in lines[1:] if ln.count("|") >= 3]
     if not rows:  # header and trailer only: nothing reported to this facility that day
         return pd.DataFrame(columns=["date", "symbol", "short_volume", "short_exempt_volume", "total_volume"])
@@ -64,6 +63,9 @@ def parse_daily(text: str) -> pd.DataFrame:
     rename = {"date": "date", "symbol": "symbol", "shortvolume": "short_volume",
               "shortexemptvolume": "short_exempt_volume", "totalvolume": "total_volume"}
     df = df.rename(columns=rename)
+    missing = {"date", "symbol", "short_volume", "total_volume"} - set(df.columns)
+    if missing:
+        raise ValueError(f"missing columns {sorted(missing)}; first line: {lines[0][:200]!r}")
     if "short_exempt_volume" not in df:
         df["short_exempt_volume"] = 0
     df = df[["date", "symbol", "short_volume", "short_exempt_volume", "total_volume"]]

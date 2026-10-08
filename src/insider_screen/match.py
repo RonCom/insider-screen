@@ -20,6 +20,8 @@ import exchange_calendars as xc
 import pandas as pd
 from rapidfuzz import fuzz, process
 
+from insider_screen.extract import model_key
+
 MIN_SCORE = 92
 MAX_SESSIONS = 3
 SUFFIXES = {
@@ -111,9 +113,9 @@ def match(traded: pd.DataFrame, companies: pd.DataFrame, events: pd.DataFrame,
 def run(db: str, model: str) -> pd.DataFrame:
     con = duckdb.connect(db)
     traded = con.execute(
-        """SELECT DISTINCT lr_no, issuer_name, announcement_date, event_type FROM extracted.traded_events
+        """SELECT DISTINCT lr_no, issuer_name, announcement_date, event_type FROM extracted.traded_events_v2
            WHERE model = ? AND is_insider_trading_case""",
-        [model],
+        [model_key(model)],
     ).df()
     companies = con.execute("SELECT cik, name, former_names FROM raw.edgar_companies").df()
     events = con.execute("SELECT event_id, cik, event_type, day0 FROM events.announcements").df()
@@ -139,7 +141,7 @@ def run(db: str, model: str) -> pd.DataFrame:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="data/insider.duckdb")
-    ap.add_argument("--model", default="qwen2.5:14b")
+    ap.add_argument("--model", default="gemma4:26b")
     a = ap.parse_args()
     run(a.db, a.model)
 
