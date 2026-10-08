@@ -25,8 +25,9 @@ EVENTS = pd.DataFrame({
 })
 
 
-def traded(name, ann, etype="acquisition_target", last_trade=None):
+def traded(name, ann, etype="acquisition_target", last_trade=None, quote=None):
     return pd.DataFrame({"lr_no": [1], "issuer_name": [name], "announcement_date": [pd.Timestamp(ann) if ann else pd.NaT],
+                         "announcement_evidence": [quote],
                          "last_trade_date": [pd.Timestamp(last_trade) if last_trade else pd.NaT],
                          "event_type": [etype]})
 
@@ -43,7 +44,7 @@ def test_fuzzy_name_and_gap():
 
 def test_reasons():
     assert match(traded("Zzyzx Widgets", "2021-06-16"), COMPANIES, EVENTS, CAL).iloc[0].reason == "no_company"
-    assert match(traded("Kindred Biosciences", None), COMPANIES, EVENTS, CAL).iloc[0].reason == "no_dates"
+    assert match(traded("Kindred Biosciences", None, etype="earnings"), COMPANIES, EVENTS, CAL).iloc[0].reason == "no_dates"
     assert match(traded("Kindred Biosciences", "2021-03-01"), COMPANIES, EVENTS, CAL).iloc[0].reason == "no_event_in_window"
 
 
@@ -65,7 +66,7 @@ def test_run_reads_events_from_edgar_file(tmp_path):
     con.execute("CREATE SCHEMA extracted")
     con.execute(
         f"""CREATE TABLE {TABLE} AS SELECT 1 AS lr_no, 'Kindred Biosciences' AS issuer_name,
-           DATE '2021-06-16' AS announcement_date, NULL::DATE AS last_trade_date, 'acquisition_target' AS event_type,
+           DATE '2021-06-16' AS announcement_date, NULL::VARCHAR AS announcement_evidence, NULL::DATE AS last_trade_date, 'acquisition_target' AS event_type,
            TRUE AS is_insider_trading_case, ? AS model""", [model_key("m")])
     con.close()
     m.run(rel, "m", edg)
@@ -79,3 +80,16 @@ def test_trade_date_fallback():
     assert (out.event_id, out.date_source) == ("acq-1", "last_trade_date")  # acquisition preferred over earnings day after
     out = match(traded("Kindred Biosciences", None, last_trade="2021-04-01"), COMPANIES, EVENTS, CAL).iloc[0]
     assert out.reason == "no_event_after_trades"  # 76 days before the event: outside the 30-day window
+
+
+def test_unique_target_event_fallback():
+    out = match(traded("Kindred Biosciences", None), COMPANIES, EVENTS, CAL).iloc[0]
+    assert (out.event_id, out.date_source) == ("acq-1", "unique_target_event")
+
+
+def test_target_disambiguated_by_quoted_year():
+    events = pd.concat([EVENTS, pd.DataFrame({"event_id": ["acq-3"], "cik": [1], "event_type": ["acquisition_target"],
+                                              "day0": pd.to_datetime(["2018-03-01"])})])
+    assert match(traded("Kindred Biosciences", None), COMPANIES, events, CAL).iloc[0].reason == "ambiguous_target"
+    out = match(traded("Kindred Biosciences", None, quote="the 2021 announcement of a merger"), COMPANIES, events, CAL).iloc[0]
+    assert out.event_id == "acq-1"

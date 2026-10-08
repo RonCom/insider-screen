@@ -6,6 +6,9 @@
    sessions of the announcement date, preferring the same event type, then the smallest gap.
 3. No verified announcement date but a verified last trade date: the first event for that CIK with
    day 0 after the last trade and within TRADE_WINDOW_DAYS calendar days, preferring the same type.
+4. Neither date, release says acquisition target: the CIK's only acquisition_target event. If it has
+   several, those in a year named in the model's announcement quote ("2011 announcement"); a match
+   needs exactly one left.
 Unmatched releases are kept with a reason so the miss rate can be reported.
 
 Usage:
@@ -101,7 +104,20 @@ def match(traded: pd.DataFrame, companies: pd.DataFrame, events: pd.DataFrame,
         if pd.isna(t.announcement_date):
             last = getattr(t, "last_trade_date", None)
             if last is None or pd.isna(last):
-                rows.append({**base, "reason": "no_dates"})
+                if t.event_type != "acquisition_target":
+                    rows.append({**base, "reason": "no_dates"})
+                    continue
+                targets = cands[cands.event_type == "acquisition_target"]
+                years = {int(y) for y in re.findall(r"\b((?:19|20)\d{2})\b",
+                                                     getattr(t, "announcement_evidence", None) or "")}
+                if len(targets) > 1 and years:
+                    targets = targets[pd.to_datetime(targets.day0).dt.year.isin(years)]
+                if len(targets) != 1:
+                    rows.append({**base, "reason": "no_target_event" if targets.empty else "ambiguous_target"})
+                    continue
+                best = targets.iloc[0]
+                rows.append({**base, "event_id": best.event_id, "event_type": best.event_type,
+                             "session_gap": None, "date_source": "unique_target_event"})
                 continue
             last = pd.Timestamp(last)
             after = cands[(cands.day0 > last) & (cands.day0 <= last + pd.Timedelta(days=TRADE_WINDOW_DAYS))]
@@ -131,7 +147,8 @@ def run(db: str, model: str, edgar_db: str = EDGAR) -> pd.DataFrame:
     con = duckdb.connect(db)
     con.execute(f"ATTACH '{Path(edgar_db).as_posix()}' AS edgar (READ_ONLY)")
     traded = con.execute(
-        f"""SELECT DISTINCT lr_no, issuer_name, announcement_date, last_trade_date, event_type FROM {TABLE}
+        f"""SELECT DISTINCT lr_no, issuer_name, announcement_date, announcement_evidence, last_trade_date,
+                   event_type FROM {TABLE}
            WHERE model = ? AND is_insider_trading_case""",
         [model_key(model)],
     ).df()
