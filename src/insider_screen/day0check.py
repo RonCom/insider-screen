@@ -69,7 +69,9 @@ def fill(csv: str, sec=None, web=None) -> pd.DataFrame:
     print(f"{len(todo)} of {len(df)} rows to look up")
     for n, i in enumerate(todo, 1):
         try:
-            found = press_release.find_release(sec, web, df.at[i, "filing_index"])
+            accepted = df.at[i, "accepted_et"] if "accepted_et" in df else ""
+            filed = pd.Timestamp(accepted).date() if accepted else None
+            found = press_release.find_release(sec, web, df.at[i, "filing_index"], filed)
         except Exception as err:  # one bad page shouldn't stop the run
             found = {"press_release_et": "", "press_release_source": "", "notes": f"lookup failed: {err}"[:300]}
         for k, v in found.items():

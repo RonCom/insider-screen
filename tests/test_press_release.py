@@ -113,3 +113,53 @@ def test_fill_skips_filled_rows_and_saves(tmp_path):
     assert out.press_release_et.tolist() == ["2023-11-02 06:00", "2020-01-01 07:00"]
     assert "x" not in sec.urls
     assert open(csv, "rb").read(3) == b"\xef\xbb\xbf"  # UTF-8 with BOM, as Excel's "CSV UTF-8"
+
+
+def test_headline_is_first_line_not_longest():
+    text = pr.exhibit_text("""<p>Filed by Six Flags Entertainment Corporation pursuant to Rule 425 under the Securities Act of 1933</p>
+<p>Six Flags and Cedar Fair to Combine in Merger of Equals</p>
+<p>Combined Company Will Benefit from Expanded and Complementary Portfolio of 42 Iconic Parks and 9 Resort Properties</p>
+<p>ARLINGTON, Texas, Nov. 2, 2023 -- Six Flags today announced...</p>""")
+    wire, d, head = pr.read_exhibit(text)
+    assert (wire, d, head) == (None, date(2023, 11, 2), "Six Flags and Cedar Fair to Combine in Merger of Equals")
+
+
+PRN_SEARCH = f"""<html><body><div class="row newsCards">
+<a class="newsreleaseconsolidatelink" href="/news-releases/six-flags-and-cedar-fair-to-combine-301975271.html">Six Flags</a>
+<a href="/news/six-flags-entertainment-corporation/">company page</a></div></body></html>"""
+
+
+def test_wire_site_search_used_first():
+    sec = Fake({INDEX_URL: INDEX, EXHIBIT_URL: EXHIBIT})
+    web = Fake({"https://www.prnewswire.com/search/news/": PRN_SEARCH, ARTICLE_URL: ARTICLE})
+    got = pr.find_release(sec, web, INDEX_URL)
+    assert got["press_release_et"] == "2023-11-02 06:00"
+    assert not any("duckduckgo" in u for u in web.urls)
+
+
+def test_press_release_in_separate_filing():
+    import json
+    index_no_ex = INDEX.replace("EX-99", "EX-10")
+    other_idx = "https://www.sec.gov/Archives/edgar/data/701374/000119312523268800/0001193125-23-268800-index.htm"
+    doc_425 = "https://www.sec.gov/Archives/edgar/data/701374/000119312523268800/d425.htm"
+    subs = {"filings": {"recent": {
+        "accessionNumber": ["0001193125-23-268712", "0001193125-23-268800", "0001193125-23-100000"],
+        "filingDate": ["2023-11-02", "2023-11-02", "2023-05-01"],
+        "form": ["8-K", "425", "425"],
+        "primaryDocument": ["d8k.htm", "d425.htm", "old.htm"]}, "files": []}}
+    sec = Fake({INDEX_URL: index_no_ex, "https://data.sec.gov/submissions/CIK0000701374.json": json.dumps(subs),
+                other_idx: "<html></html>", doc_425: EXHIBIT})
+    web = Fake({"https://www.prnewswire.com/search/news/": PRN_SEARCH, ARTICLE_URL: ARTICLE})
+    got = pr.find_release(sec, web, INDEX_URL, filed=date(2023, 11, 2))
+    assert got["press_release_et"] == "2023-11-02 06:00" and doc_425 in got["notes"]
+    assert not any("old.htm" in u for u in sec.urls)
+
+
+def test_no_dateline_needs_close_title_and_filing_window():
+    exhibit = EXHIBIT.replace("Nov. 2, 2023 /PRNewswire/ --", "--")
+    sec = Fake({INDEX_URL: INDEX, EXHIBIT_URL: exhibit})
+    web = Fake({"https://www.globenewswire.com/search/": "", "https://www.prnewswire.com/search/news/": PRN_SEARCH,
+                ARTICLE_URL: ARTICLE})
+    assert pr.find_release(sec, web, INDEX_URL, filed=date(2023, 11, 2))["press_release_et"] == "2023-11-02 06:00"
+    got = pr.find_release(sec, web, INDEX_URL, filed=date(2023, 12, 1))
+    assert got["press_release_et"] == "" and "filed 2023-12-01" in got["notes"]

@@ -44,6 +44,9 @@ DATE_RE = re.compile(rf"{MONTH}\s+\d{{1,2}},?\s+\d{{4}}")
 TIME_TEXT_RE = re.compile(
     rf"({MONTH}\s+\d{{1,2}},?\s+\d{{4}}),?\s+(\d{{1,2}}:\d{{2}})\s*(AM|PM)?\s*"
     r"(?:ET|EST|EDT|Eastern(?:\s+(?:Daylight|Standard))?(?:\s+Time)?)\b", re.I)
+BOILERPLATE_RE = re.compile(
+    r"pursuant to Rule|Securities Act of 1933|Exchange Act of 1934|Subject Company|Commission File|"
+    r"Filed by|Form 8-K|Exhibit 99|Registration (?:No|Statement)|^Page \d|^\(Translation", re.I)
 SKIP_LINE_RE = re.compile(r"^(?:exhibit|ex-?\s*99|press release|news release|for immediate release|"
                           r"contacts?|media|investors?|source)\b", re.I)
 
@@ -98,14 +101,23 @@ def read_exhibit(text: str) -> tuple[str | None, date | None, str | None]:
         dates = list(DATE_RE.finditer(text[max(0, pos - 250):pos + 120]))
         dl_date = _parse_date(dates[0].group(0)) if dates else None
     else:  # no wire: the first date near the top is the dateline
-        m = DATE_RE.search(text[:2000])
+        m = DATE_RE.search(text[:5000])
         if m:
             dl_date, head_end = _parse_date(m.group(0)), m.start()
-    top = text[:head_end] if head_end is not None else text[:1500]
-    lines = [ln for ln in top.splitlines() if len(ln.split()) >= 5 and not SKIP_LINE_RE.match(ln)
-             and not DATE_RE.search(ln)]
-    headline = max(lines[:6], key=len) if lines else None
-    return wire, dl_date, headline
+    top = text[:head_end] if head_end is not None else text[:3000]
+    return wire, dl_date, headline_of(top)
+
+
+def headline_of(top: str) -> str | None:
+    """The headline is the first substantial line of the release; sub-headings follow it and are often longer.
+    Filing boilerplate above it ("Filed by ... pursuant to Rule 425") is skipped."""
+    candidates = [ln for ln in top.splitlines()
+                  if not SKIP_LINE_RE.match(ln) and not DATE_RE.search(ln) and not BOILERPLATE_RE.search(ln)]
+    for min_words in (5, 3):
+        for ln in candidates:
+            if len(ln.split()) >= min_words and not ln.isupper() or len(ln.split()) >= 8:
+                return ln[:200]
+    return None
 
 
 def search_urls(html: str | bytes) -> list[str]:
@@ -126,6 +138,27 @@ def search_urls(html: str | bytes) -> list[str]:
                 except (ValueError, UnicodeDecodeError):
                     continue
         out.append(href)
+    return out
+
+
+# Each wire's own search page, and the path its article links use.
+SITE_SEARCH = {
+    "PR Newswire": ("https://www.prnewswire.com/search/news/?keyword={q}&pagesize=25", "/news-releases/"),
+    "GlobeNewswire": ("https://www.globenewswire.com/search/keyword/{q}", "/news-release/"),
+}
+
+
+def site_search_url(wire: str, query: str) -> str:
+    return SITE_SEARCH[wire][0].format(q=quote_plus(query))
+
+
+def article_links(html: str | bytes, base: str, path: str) -> list[str]:
+    """Article links on a wire's own search results page."""
+    out = []
+    for a in BeautifulSoup(html, "lxml").find_all("a", href=True):
+        url = urljoin(base, a["href"].split("#")[0])
+        if path in urlparse(url).path and url not in out:
+            out.append(url)
     return out
 
 
@@ -204,53 +237,140 @@ def on_wire(url: str, domains: tuple[str, ...] = ALL_DOMAINS) -> bool:
     return any(host == d or host.endswith("." + d) for d in domains)
 
 
-def find_release(sec, web, index_url: str, max_candidates: int = 4) -> dict:
-    """Look up one filing. `sec` and `web` are PoliteClient-like objects with get(url, ...) -> (status, body).
-    Returns press_release_et ('YYYY-MM-DD HH:MM' or ''), press_release_source and notes."""
-    status, body = sec.get(index_url)
+SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
+INDEX_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{folder}/{acc}-index.htm"
+DOC_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{folder}/{doc}"
+RELATED_FORMS = {"8-K", "425", "DEFA14A", "SC14D9C", "SC 14D9-C", "SC TO-C", "8-K12B", "6-K"}
+
+
+def _filings(sec, cik: int) -> pd.DataFrame:
+    """All of a filer's filings from the submissions API, including the older pages."""
+    status, body = sec.get(SUBMISSIONS_URL.format(cik=cik))
     if status != 200:
-        return {"press_release_et": "", "press_release_source": "", "notes": f"filing index returned {status}"}
-    ex_url = exhibit_url(body, index_url)
-    if ex_url is None:
-        return {"press_release_et": "", "press_release_source": "",
-                "notes": "no EX-99 exhibit in this 8-K; the press release may be in a separate filing (425 or 8-K)"}
-    status, ex_body = sec.get(ex_url)
-    if status != 200:
-        return {"press_release_et": "", "press_release_source": "", "notes": f"exhibit {ex_url} returned {status}"}
-    wire, dl_date, headline = read_exhibit(exhibit_text(ex_body))
-    if not headline:
-        return {"press_release_et": "", "press_release_source": "", "notes": f"no headline found in {ex_url}"}
+        return pd.DataFrame()
+    data = json.loads(body)
+    blocks = [data.get("filings", {}).get("recent", {})]
+    for f in data.get("filings", {}).get("files", []):
+        st, b = sec.get("https://data.sec.gov/submissions/" + f["name"])
+        if st == 200:
+            blocks.append(json.loads(b))
+    cols = ["accessionNumber", "filingDate", "form", "primaryDocument"]
+    frames = [pd.DataFrame({c: blk.get(c, []) for c in cols}) for blk in blocks if blk]
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=cols)
+
+
+def related_documents(sec, cik: int, accession: str, day: date) -> list[str]:
+    """Press-release candidates the same filer filed on `day` or the day after: EX-99 exhibits of each
+    filing, or the primary document of a 425, DEFA14A or SC14D9C (those are often the release itself)."""
+    df = _filings(sec, cik)
+    if df.empty:
+        return []
+    when = pd.to_datetime(df.filingDate).dt.date
+    near = df[(when >= day) & (when <= day + pd.Timedelta(days=1)) & df.form.isin(RELATED_FORMS)
+              & (df.accessionNumber != accession)]
+    out = []
+    for acc, form, doc in near[["accessionNumber", "form", "primaryDocument"]].itertuples(index=False):
+        folder = acc.replace("-", "")
+        idx = INDEX_URL.format(cik=cik, folder=folder, acc=acc)
+        st, body = sec.get(idx)
+        ex = exhibit_url(body, idx) if st == 200 else None
+        if ex:
+            out.append(ex)
+        elif form != "8-K" and doc:
+            out.append(DOC_URL.format(cik=cik, folder=folder, doc=doc))
+    return out
+
+
+def _accession_cik(index_url: str) -> tuple[int, str]:
+    m = re.search(r"/data/(\d+)/\d+/(\d{10}-\d{2}-\d{6})-index", index_url)
+    return int(m.group(1)), m.group(2)
+
+
+def _candidates(web, wire: str | None, headline: str) -> tuple[list[str], list[str]]:
+    """Article URLs for a headline: the wire's own search first (both searchable wires when the exhibit
+    doesn't name one), then DuckDuckGo and Bing. Returns (urls, what each search returned)."""
+    log, urls = [], []
+    q = " ".join(headline.split()[:14])
+    wires = [wire] if wire in SITE_SEARCH else ([] if wire else list(SITE_SEARCH))
+    for w in wires:
+        url = site_search_url(w, q)
+        status, page = web.get(url, use_cache=False, store=False)
+        found = article_links(page, url, SITE_SEARCH[w][1]) if status == 200 else []
+        log.append(f"{w} search {status}: {len(found)} links")
+        urls += [u for u in found if u not in urls]
+    if urls:
+        return urls, log
     domains = WIRES[wire][0] if wire else ALL_DOMAINS
     site = " OR ".join(f"site:{d}" for d in domains)
-    query = f'"{headline[:150]}" {site}'
-    candidates: list[str] = []
-    for url in (ddg_url(query), bing_url(query), ddg_url(f"{headline[:150]} {site}")):
+    for name, url in (("DuckDuckGo", ddg_url(f'"{headline[:150]}" {site}')),
+                      ("Bing", bing_url(f'"{headline[:150]}" {site}'))):
         status, page = web.get(url, use_cache=False, store=False)
-        if status == 200:
-            candidates += [u for u in search_urls(page) if on_wire(u, domains) and u not in candidates]
-        if candidates:
+        found = [u for u in search_urls(page) if on_wire(u, domains)] if status == 200 else []
+        log.append(f"{name} {status}: {len(found)} links")
+        urls += [u for u in found if u not in urls]
+        if urls:
             break
+    return urls, log
+
+
+def _check_page(web, url: str, headline: str, dl_date: date | None, filed: date | None):
+    """(time, how, title score) if the page passes, else (None, reason, score)."""
+    status, page = web.get(url)
+    if status != 200:
+        return None, f"page {status}", 0
+    t, how = page_time(page)
+    score = fuzz.token_set_ratio(headline.lower(), page_title(page).lower())
+    if t is None:
+        return None, how, score
+    if dl_date is not None:
+        if score < MIN_TITLE_SCORE:
+            return None, f"title match {score:.0f}", score
+        if t.date() != dl_date:
+            return None, f"published {t:%Y-%m-%d %H:%M} ET, dateline {dl_date}", score
+    else:  # no dateline: stricter title match, and within 3 days before or on the filing date
+        if score < 85:
+            return None, f"title match {score:.0f} (no dateline, 85 needed)", score
+        if filed is not None and not (filed - pd.Timedelta(days=3) <= t.date() <= filed):
+            return None, f"published {t:%Y-%m-%d} ET, filed {filed}", score
+    return t, how, score
+
+
+def find_release(sec, web, index_url: str, filed: date | None = None, max_candidates: int = 5) -> dict:
+    """Look up one filing. `sec` and `web` are PoliteClient-like objects with get(url, ...) -> (status, body).
+    `filed` is the 8-K's acceptance date (Eastern). Returns press_release_et ('YYYY-MM-DD HH:MM' or ''),
+    press_release_source and notes."""
+    def blank(note: str) -> dict:
+        return {"press_release_et": "", "press_release_source": "", "notes": note}
+
+    status, body = sec.get(index_url)
+    if status != 200:
+        return blank(f"filing index returned {status}")
+    docs = [u for u in [exhibit_url(body, index_url)] if u]
+    if filed is not None:
+        cik, acc = _accession_cik(index_url)
+        docs += related_documents(sec, cik, acc, filed)
+    if not docs:
+        return blank("no EX-99 exhibit in this 8-K and no press release filed the same or next day")
+    for doc in docs:
+        status, ex_body = sec.get(doc)
+        if status != 200:
+            continue
+        wire, dl_date, headline = read_exhibit(exhibit_text(ex_body))
+        if headline:
+            break
+    else:
+        return blank(f"no headline found in {' | '.join(docs)}")
+    candidates, log = _candidates(web, wire, headline)
     rejected = []
     for url in candidates[:max_candidates]:
-        status, page = web.get(url)
-        if status != 200:
-            rejected.append(f"{url} ({status})")
-            continue
-        t, how = page_time(page)
-        score = fuzz.token_set_ratio(headline.lower(), page_title(page).lower())
+        t, how, score = _check_page(web, url, headline, dl_date, filed)
         if t is None:
             rejected.append(f"{url} ({how})")
             continue
-        if score < MIN_TITLE_SCORE:
-            rejected.append(f"{url} (title match {score:.0f})")
-            continue
-        if dl_date is not None and t.date() != dl_date:
-            rejected.append(f"{url} (published {t:%Y-%m-%d %H:%M} ET, dateline {dl_date})")
-            continue
         return {"press_release_et": f"{t:%Y-%m-%d %H:%M}", "press_release_source": url,
                 "notes": f"auto: {wire or 'wire not named'}; time from {how}; title match {score:.0f}; "
-                         f"dateline {dl_date}; exhibit {ex_url}"}
-    tried = "; rejected: " + " | ".join(rejected) if rejected else ""
-    return {"press_release_et": "", "press_release_source": "",
-            "notes": f"not found automatically ({wire or 'wire not named'}, dateline {dl_date}){tried}; "
-                     f"exhibit {ex_url}; search {ddg_url(headline[:150])}"}
+                         f"dateline {dl_date}; release {doc}"}
+    tried = f"; rejected: {' | '.join(rejected)}" if rejected else ""
+    return blank(f"not found automatically ({wire or 'wire not named'}, dateline {dl_date}; "
+                 f"headline '{headline[:80]}'; {'; '.join(log)}){tried}; release {doc}; "
+                 f"search {ddg_url(headline[:150])}")
