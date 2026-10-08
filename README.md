@@ -57,8 +57,10 @@ uv run python -m insider_screen.edgar download
 # 2. Load filer details and the filing types the event rules use (raw.edgar_companies, raw.edgar_filings)
 uv run python -m insider_screen.edgar load
 
-# 3. Check the timestamp reading: earnings 8-Ks should cluster at 16-17h and 6-9h
+# 3. Check the timestamps: hour histogram of earnings 8-Ks, then a sample compared with each filing's
+#    index header (Eastern time) by source; `events` converts each source to Eastern from that check
 uv run python -m insider_screen.edgar check-tz
+uv run python -m insider_screen.edgar tz-sample
 
 # 4. Build events.announcements: earnings, acquisition targets, other material candidates; day 0 per NYSE calendar
 uv run python -m insider_screen.edgar events

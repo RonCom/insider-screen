@@ -13,13 +13,16 @@ Event types (spec, "Events"):
 - other_material_candidate: 8-K with Item 7.01 or 8.01 and neither 1.01 nor 2.02. The spec keeps
   these only if the day-0 abnormal return exceeds 10%, which needs prices (later step).
 
-Timestamps: acceptanceDateTime ends in "Z" but is treated as US Eastern time. Check it with
-`check-tz` before relying on day 0: earnings 8-Ks should cluster just after 16:00 and before 09:30.
+Timestamps: acceptanceDateTime ends in "Z", but the hour histogram of earnings 8-Ks mixes Eastern-time
+and UTC peaks, with the UTC share rising year by year. `tz-sample` compares a sample against each
+filing's index header (Eastern time), by source: the filer's "recent" block or its continuation files.
+`events` converts each source to Eastern time from that check.
 
 Usage:
     uv run python -m insider_screen.edgar download
     uv run python -m insider_screen.edgar load
     uv run python -m insider_screen.edgar check-tz
+    uv run python -m insider_screen.edgar tz-sample
     uv run python -m insider_screen.edgar events
 """
 
@@ -27,8 +30,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import zipfile
-from datetime import time
+from datetime import datetime, time
 from pathlib import Path
 
 import duckdb
@@ -69,12 +73,12 @@ def download(dest: str = "data/edgar/submissions.zip") -> Path:
     return path
 
 
-def _rows(block: dict, cik: int) -> list[tuple]:
+def _rows(block: dict, cik: int, src: str) -> list[tuple]:
     cols = [block.get(k, []) for k in FIELDS]
     out = []
     for acc, fdate, accepted, form, items in zip(*cols):
         if form in KEEP_FORMS:
-            out.append((cik, acc, fdate, accepted, form, items or ""))
+            out.append((cik, acc, fdate, accepted, form, items or "", src))
     return out
 
 
@@ -92,8 +96,8 @@ def parse_member(name: str, data: dict) -> tuple[dict | None, list[tuple]]:
             "exchanges": "|".join(x or "" for x in (data.get("exchanges") or [])),
             "former_names": "|".join(f.get("name", "") for f in data.get("formerNames") or []),
         }
-        return company, _rows(data["filings"].get("recent", {}), cik)
-    return None, _rows(data, cik)
+        return company, _rows(data["filings"].get("recent", {}), cik, "recent")
+    return None, _rows(data, cik, "file")
 
 
 def load(zip_path: str, db: str) -> None:
@@ -108,7 +112,7 @@ def load(zip_path: str, db: str) -> None:
             if i % 100_000 == 0:
                 print(f"  {i}/{len(names)} files, {len(filings):,} filings kept")
     cdf = pd.DataFrame(companies)
-    fdf = pd.DataFrame(filings, columns=["cik", "accession", "filing_date", "accepted_raw", "form", "items"])
+    fdf = pd.DataFrame(filings, columns=["cik", "accession", "filing_date", "accepted_raw", "form", "items", "src"])
     con = duckdb.connect(db)
     con.execute("CREATE SCHEMA IF NOT EXISTS raw")
     con.register("cdf", cdf)
@@ -117,9 +121,9 @@ def load(zip_path: str, db: str) -> None:
     con.execute(
         """CREATE OR REPLACE TABLE raw.edgar_filings AS
            SELECT DISTINCT cik, accession, CAST(filing_date AS DATE) AS filing_date,
-                  -- the trailing Z is ignored: values are read as US Eastern wall-clock time
-                  TRY_CAST(replace(replace(accepted_raw, 'T', ' '), '.000Z', '') AS TIMESTAMP) AS accepted_et,
-                  form, items
+                  -- wall-clock value as given, trailing Z dropped; tz-sample decides how to read it per src
+                  TRY_CAST(replace(replace(accepted_raw, 'T', ' '), '.000Z', '') AS TIMESTAMP) AS accepted_json,
+                  form, items, src
            FROM fdf"""
     )
     n = con.execute("SELECT count(*) FROM raw.edgar_filings").fetchone()[0]
@@ -131,8 +135,8 @@ def check_tz(db: str) -> pd.DataFrame:
     """Hour-of-day histogram for earnings 8-Ks. Read as Eastern, expect peaks at 16-17 and 6-9."""
     con = duckdb.connect(db, read_only=True)
     df = con.execute(
-        """SELECT hour(accepted_et) AS hour, count(*) AS n FROM raw.edgar_filings
-           WHERE form = '8-K' AND items LIKE '%2.02%' AND year(accepted_et) BETWEEN 2016 AND 2025
+        """SELECT hour(accepted_json) AS hour, count(*) AS n FROM raw.edgar_filings
+           WHERE form = '8-K' AND items LIKE '%2.02%' AND year(accepted_json) BETWEEN 2016 AND 2025
            GROUP BY 1 ORDER BY 1"""
     ).df()
     con.close()
@@ -159,8 +163,82 @@ def day0(accepted: pd.Series, cal: xc.ExchangeCalendar) -> pd.Series:
     return pd.Series(out, index=accepted.index, dtype="datetime64[ns]")
 
 
+HEADER_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{folder}/{acc}-index-headers.html"
+ACCEPT_RE = re.compile(r"ACCEPTANCE-DATETIME>\s*(\d{14})")
+ERAS = [("2016-01-01", "2018-12-31"), ("2019-01-01", "2021-12-31"), ("2022-01-01", "2025-12-31")]
+
+
+def tz_sample(db: str, per_cell: int = 15, seed: int = 42) -> pd.DataFrame:
+    """Compare the JSON timestamp with the ACCEPTANCE-DATETIME in each filing's index header (Eastern
+    time) for a sample of 8-Ks per source (recent block vs continuation files) and era. Stores the
+    offsets in raw.edgar_tz_check; build_events reads them to convert each source to Eastern time."""
+    from insider_screen.http import PoliteClient
+
+    con = duckdb.connect(db)
+    parts = []
+    for src in ("recent", "file"):
+        for lo, hi in ERAS:
+            parts.append(con.execute(
+                f"""SELECT cik, accession, accepted_json, src, ? AS era FROM raw.edgar_filings
+                    WHERE form = '8-K' AND src = ? AND filing_date BETWEEN ? AND ?
+                    ORDER BY hash(accession || '{int(seed)}') LIMIT {int(per_cell)}""",
+                [f"{lo[:4]}-{hi[:4]}", src, lo, hi]).df())
+    sample = pd.concat(parts, ignore_index=True)
+    client = PoliteClient(cache_dir="data/cache/sec")
+    offsets = []
+    for r in sample.itertuples(index=False):
+        url = HEADER_URL.format(cik=int(r.cik), folder=r.accession.replace("-", ""), acc=r.accession)
+        status, body = client.get(url)
+        m = ACCEPT_RE.search(body.decode("latin-1")) if status == 200 else None
+        if not m or pd.isna(r.accepted_json):
+            offsets.append(None)
+            continue
+        header = pd.Timestamp(datetime.strptime(m.group(1), "%Y%m%d%H%M%S"))
+        offsets.append(round((pd.Timestamp(r.accepted_json) - header).total_seconds() / 3600, 2))
+    sample["offset_hours"] = offsets
+    con.execute("CREATE SCHEMA IF NOT EXISTS raw")
+    con.register("s", sample)
+    con.execute("CREATE OR REPLACE TABLE raw.edgar_tz_check AS SELECT * FROM s")
+    con.close()
+    table = sample.groupby(["src", "era"]).offset_hours.agg(
+        lambda x: ", ".join(f"{k:g}h x{v}" for k, v in x.value_counts(dropna=False).sort_index().items()))
+    print("JSON time minus header time (Eastern), by source and era:")
+    print(table.to_string())
+    return sample
+
+
+def tz_rules(con) -> dict[str, str]:
+    """Per source: 'ET' if the JSON time equals Eastern time, 'UTC' if it runs 4-5 hours ahead."""
+    try:
+        df = con.execute("SELECT src, offset_hours FROM raw.edgar_tz_check WHERE offset_hours IS NOT NULL").df()
+    except duckdb.CatalogException:
+        print("No tz check found (run `edgar tz-sample`); reading all timestamps as Eastern time.")
+        return {"recent": "ET", "file": "ET"}
+    rules = {}
+    for src, g in df.groupby("src"):
+        vals = set(g.offset_hours.round().astype(int))
+        if vals <= {0}:
+            rules[src] = "ET"
+        elif vals <= {4, 5}:
+            rules[src] = "UTC"
+        else:
+            raise SystemExit(f"Timestamps in '{src}' are mixed ({sorted(vals)} hours); day 0 can't be set by source.")
+    return rules
+
+
+def to_eastern(ts: pd.Series, src: pd.Series, rules: dict[str, str]) -> pd.Series:
+    ts = pd.to_datetime(ts)
+    utc = src.map(rules).eq("UTC")
+    out = ts.copy()
+    if utc.any():
+        out[utc] = (ts[utc].dt.tz_localize("UTC").dt.tz_convert("America/New_York").dt.tz_localize(None))
+    return out
+
+
 def build_events(db: str, start: str = "2016-01-01", end: str = "2025-12-31") -> pd.DataFrame:
     con = duckdb.connect(db)
+    rules = tz_rules(con)
+    print(f"Timestamp reading by source: {rules}")
     universe = con.execute(
         """SELECT DISTINCT f.cik FROM raw.edgar_filings f JOIN raw.edgar_companies c USING (cik)
            WHERE f.form IN ('10-K', '10-Q') AND f.filing_date BETWEEN ? AND ?
@@ -169,10 +247,11 @@ def build_events(db: str, start: str = "2016-01-01", end: str = "2025-12-31") ->
     ).df()
     con.register("universe", universe)
     eightk = con.execute(
-        """SELECT cik, accession, filing_date, accepted_et, items FROM raw.edgar_filings
+        """SELECT cik, accession, filing_date, accepted_json, src, items FROM raw.edgar_filings
            WHERE form = '8-K' AND filing_date BETWEEN ? AND ? AND cik IN (SELECT cik FROM universe)""",
         [start, end],
     ).df()
+    eightk["accepted_et"] = to_eastern(eightk.accepted_json, eightk.src, rules)
     target_forms = con.execute(
         f"""SELECT cik, form, filing_date FROM raw.edgar_filings
             WHERE form IN ({",".join("'" + f + "'" for f in TARGET_FORMS)})
@@ -235,6 +314,8 @@ def main() -> None:
     ld.add_argument("--db", default=EDGAR)
     t = sub.add_parser("check-tz")
     t.add_argument("--db", default=EDGAR)
+    ts = sub.add_parser("tz-sample")
+    ts.add_argument("--db", default=EDGAR)
     e = sub.add_parser("events")
     e.add_argument("--db", default=EDGAR)
     e.add_argument("--start", default="2016-01-01")
@@ -246,6 +327,8 @@ def main() -> None:
         load(a.zip, a.db)
     elif a.cmd == "check-tz":
         check_tz(a.db)
+    elif a.cmd == "tz-sample":
+        tz_sample(a.db)
     else:
         build_events(a.db, a.start, a.end)
 

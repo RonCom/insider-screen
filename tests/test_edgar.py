@@ -73,3 +73,47 @@ def test_load_and_events(tmp_path):
     assert str(got[("earnings", "0001-23-000005")].day0.date()) == "2023-05-03"
     assert ("other_material_candidate", "0001-17-000001") in got  # from the continuation file
     assert not (ev.cik == 1002).any()  # fund excluded
+
+
+def test_src_tag_and_tz_sample(tmp_path, monkeypatch):
+    db = str(tmp_path / "t.duckdb")
+    edgar.load(str(_zip(tmp_path)), db)
+    con = duckdb.connect(db)
+    assert set(con.execute("SELECT DISTINCT src FROM raw.edgar_filings").fetchall()) == {("recent",), ("file",)}
+    stamps = {a: (t, s) for a, t, s in con.execute("SELECT accession, accepted_json, src FROM raw.edgar_filings").fetchall()}
+    con.close()
+
+    # headers say Eastern time: recent JSON runs 4 hours ahead (UTC in June), continuation files match
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def get(self, url):
+            acc = url.rsplit("/", 1)[1].replace("-index-headers.html", "")
+            ts, src = stamps[acc]
+            et = ts - pd.Timedelta(hours=4) if src == "recent" else ts
+            return 200, f"<ACCEPTANCE-DATETIME>{et:%Y%m%d%H%M%S}".encode()
+
+    import insider_screen.http
+    monkeypatch.setattr(insider_screen.http, "PoliteClient", FakeClient)
+    monkeypatch.setattr(edgar, "ERAS", [("2016-01-01", "2025-12-31")])
+    edgar.tz_sample(db, per_cell=10)
+    con = duckdb.connect(db)
+    assert edgar.tz_rules(con) == {"recent": "UTC", "file": "ET"}
+    con.close()
+
+    ev = edgar.build_events(db, start="2016-01-01", end="2025-12-31")
+    tgt = ev[ev.accession == "0001-23-000002"].iloc[0]  # JSON 07:15 read as UTC -> 03:15 ET, still pre-open
+    assert str(tgt.accepted_et) == "2023-06-05 03:15:00" and str(tgt.day0.date()) == "2023-06-05"
+    earn = ev[ev.accession == "0001-23-000005"].iloc[0]  # JSON 16:05 UTC -> 12:05 ET, during the session
+    assert str(earn.day0.date()) == "2023-05-02"
+
+
+def test_mixed_offsets_stop_events(tmp_path):
+    import pytest
+    db = str(tmp_path / "m.duckdb")
+    con = duckdb.connect(db)
+    con.execute("CREATE SCHEMA raw")
+    con.execute("CREATE TABLE raw.edgar_tz_check AS SELECT * FROM (VALUES ('recent', 0.0), ('recent', 4.0)) t(src, offset_hours)")
+    with pytest.raises(SystemExit):
+        edgar.tz_rules(con)
