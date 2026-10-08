@@ -102,3 +102,15 @@ uv run python -m insider_screen.prices --symbols CELG,TWTR,ATVI --db data/test.d
 # 2. Every symbol in raw.finra_short_daily plus SPY, raw and adjusted (raw.alpaca_bars_daily in data/prices.duckdb); resumable
 uv run python -m insider_screen.prices --start 2016-01-01 --end 2025-12-31
 ```
+
+## Hand checks
+
+```powershell
+# Extraction (spec gate: 0.90 on issuer and announcement date)
+uv run python -m insider_screen.extract sample     # data/handcheck.csv: fill ok_* with Y or N
+uv run python -m insider_screen.extract score
+
+# Day 0 for acquisition targets (spec: switch to press-release time if more than 5 of 50 differ)
+uv run python -m insider_screen.day0check sample   # data/day0_check.csv: fill press_release_et
+uv run python -m insider_screen.day0check score
+```
