@@ -116,5 +116,7 @@ uv run python -m insider_screen.extract score
 
 # Day 0 for acquisition targets (spec: switch to press-release time if more than 5 of 50 differ)
 uv run python -m insider_screen.day0check sample   # data/day0_check.csv: fill press_release_et
+uv run python -m insider_screen.day0check fill     # looks up each 8-K's press release on its newswire;
+                                                   # resumable; unresolved rows get a note and a search link
 uv run python -m insider_screen.day0check score
 ```

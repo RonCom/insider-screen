@@ -6,11 +6,16 @@ press-release time.
 
 Usage:
     uv run python -m insider_screen.day0check sample      # writes data/day0_check.csv
+    uv run python -m insider_screen.day0check fill        # looks up press-release times (press_release.py)
     uv run python -m insider_screen.day0check score
 
 In the CSV, fill press_release_et with the release's date and Eastern time ("2021-06-16 07:00"),
 press_release_source with the URL you took it from, and notes as needed. Leave press_release_et
 blank for an event you couldn't resolve; it is reported, not scored.
+
+`fill` does the lookup for rows whose press_release_et is blank and saves after each row, so it can be
+stopped and rerun. Its notes start with "auto:" and name the exhibit and how the time was read; rows it
+couldn't resolve get the reason and a search link. Check a few filled rows against their pages too.
 """
 
 from __future__ import annotations
@@ -22,8 +27,10 @@ import duckdb
 import exchange_calendars as xc
 import pandas as pd
 
+from insider_screen import press_release
 from insider_screen.db import EDGAR
 from insider_screen.edgar import day0
+from insider_screen.http import DEFAULT_USER_AGENT, PoliteClient
 
 INDEX_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{folder}/{acc}-index.htm"
 N = 50
@@ -52,8 +59,30 @@ def sample(db: str, out: str, n: int = N, seed: int = 42, start: str = "2017-01-
     return df
 
 
+def fill(csv: str, sec=None, web=None) -> pd.DataFrame:
+    """Fill press_release_et, press_release_source and notes for rows left blank. Saves after each row."""
+    sec = sec or PoliteClient(cache_dir="data/cache/sec", user_agent=DEFAULT_USER_AGENT, max_per_second=5)
+    web = web or PoliteClient(cache_dir="data/cache/press", user_agent=press_release.BROWSER_UA,
+                              max_per_second=0.5)
+    df = pd.read_csv(csv, dtype=str, encoding="utf-8-sig").fillna("")
+    todo = df.index[df.press_release_et.str.strip() == ""]
+    print(f"{len(todo)} of {len(df)} rows to look up")
+    for n, i in enumerate(todo, 1):
+        try:
+            found = press_release.find_release(sec, web, df.at[i, "filing_index"])
+        except Exception as err:  # one bad page shouldn't stop the run
+            found = {"press_release_et": "", "press_release_source": "", "notes": f"lookup failed: {err}"[:300]}
+        for k, v in found.items():
+            df.at[i, k] = v
+        df.to_csv(csv, index=False, encoding="utf-8-sig")
+        print(f"  {n}/{len(todo)} {df.at[i, 'company'][:40]}: {found['press_release_et'] or 'not found'}")
+    done = (df.press_release_et.str.strip() != "").sum()
+    print(f"{done} of {len(df)} rows have a press-release time; the rest have a note and a search link")
+    return df
+
+
 def score(csv: str) -> pd.DataFrame:
-    df = pd.read_csv(csv, dtype=str).fillna("")
+    df = pd.read_csv(csv, dtype=str, encoding="utf-8-sig").fillna("")
     filled = df[df.press_release_et.str.strip() != ""].copy()
     pr = pd.to_datetime(filled.press_release_et.str.strip(), errors="coerce")
     bad = filled[pr.isna()]
@@ -88,11 +117,15 @@ def main() -> None:
     s.add_argument("--db", default=EDGAR)
     s.add_argument("--out", default="data/day0_check.csv")
     s.add_argument("--n", type=int, default=N)
+    f = sub.add_parser("fill")
+    f.add_argument("--csv", default="data/day0_check.csv")
     c = sub.add_parser("score")
     c.add_argument("--csv", default="data/day0_check.csv")
     a = ap.parse_args()
     if a.cmd == "sample":
         sample(a.db, a.out, a.n)
+    elif a.cmd == "fill":
+        fill(a.csv)
     else:
         score(a.csv)
 
