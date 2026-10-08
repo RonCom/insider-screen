@@ -186,6 +186,31 @@ def aggregate_monthly(lines: io.TextIOBase) -> pd.DataFrame:
         small_trades=("small_trades", "sum"))
 
 
+def aggregate_zip(zip_path: Path, work_dir: Path) -> pd.DataFrame:
+    """Same output as aggregate_monthly, computed by DuckDB on the unzipped text file.
+    A 1 GB part unzips to several GB; DuckDB reads it in parallel, far faster than line-by-line Python."""
+    with zipfile.ZipFile(zip_path) as zf:
+        member = zf.namelist()[0]
+        txt = Path(zf.extract(member, work_dir))
+    try:
+        con = duckdb.connect()
+        src = f"read_csv('{txt.as_posix()}', delim='|', header=true, all_varchar=true, ignore_errors=true)"
+        cols = {c.lower(): c for c in con.execute(f"SELECT * FROM {src} LIMIT 0").df().columns}
+        need = {"symbol", "date", "size"}
+        if not need <= set(cols):
+            raise ValueError(f"unexpected header {list(cols)}; expected columns including {sorted(need)}")
+        df = con.execute(f"""
+            SELECT strptime("{cols['date']}", '%Y%m%d')::DATE AS date, "{cols['symbol']}" AS symbol,
+                   count(*) AS short_trades, sum(sz) AS short_shares, sum((sz <= 100)::INT) AS small_trades
+            FROM (SELECT *, TRY_CAST("{cols['size']}" AS BIGINT) AS sz FROM {src})
+            WHERE sz IS NOT NULL AND regexp_full_match("{cols['date']}", '\\d{{8}}')
+            GROUP BY 1, 2""").df()
+        con.close()
+        return df
+    finally:
+        txt.unlink(missing_ok=True)
+
+
 def _agg(rows: list[tuple]) -> pd.DataFrame:
     df = pd.DataFrame(rows, columns=["date", "symbol", "size"])
     df["size"] = pd.to_numeric(df["size"], errors="coerce")
@@ -233,10 +258,7 @@ def load_monthly(db: str, start: str, end: str, keep_zips: bool = False) -> None
                         print(f"  {status} {url}")
                     path.unlink()
                     continue
-                with zipfile.ZipFile(path) as zf:
-                    name = zf.namelist()[0]
-                    with zf.open(name) as fh:
-                        df = aggregate_monthly(io.TextIOWrapper(fh, encoding="latin-1"))
+                df = aggregate_zip(path, zdir)
                 df["facility"], df["file_month"] = fac, month
                 con.register("df", df)
                 con.execute("INSERT INTO raw.finra_short_trades_daily SELECT * FROM df")

@@ -85,3 +85,21 @@ def test_find_parts_and_labels():
     parts = ss.find_parts(head, "FNSQ", 2026, 8)
     assert [ss.part_label(u) for u in parts] == ["FNSQ_1", "FNSQ_2"]
     assert ss.find_parts(head, "FNQC", 2016, 3) == []
+
+
+def test_aggregate_zip_matches_streaming(tmp_path):
+    import zipfile
+    text = """MarketCenter|Symbol|Date|Time|ShortType|Size|Price|LinkIndicator
+Q|AAA|20160301|09:30:01|S|100|10.0|A
+Q|AAA|20160301|09:31:00|S|500|10.1|A
+Q|BBB|20160302|10:00:00|E|50|5.0|A
+3
+"""
+    z = tmp_path / "FNSQsh201603_1.zip"
+    with zipfile.ZipFile(z, "w") as zf:
+        zf.writestr("FNSQsh201603_1.txt", text)
+    a = ss.aggregate_zip(z, tmp_path).sort_values(["date", "symbol"]).reset_index(drop=True)
+    b = ss.aggregate_monthly(io.StringIO(text)).sort_values(["date", "symbol"]).reset_index(drop=True)
+    assert a[["symbol", "short_trades", "short_shares", "small_trades"]].values.tolist() == \
+        b[["symbol", "short_trades", "short_shares", "small_trades"]].values.tolist()
+    assert not (tmp_path / "FNSQsh201603_1.txt").exists()
