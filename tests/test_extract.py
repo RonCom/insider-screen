@@ -38,6 +38,7 @@ def test_traded_events_view(tmp_path, monkeypatch):
     con.execute("CREATE SCHEMA raw")
     con.execute("CREATE TABLE raw.sec_litigation_releases AS SELECT 1 AS lr_no, 'x' AS text, TRUE AS is_insider_candidate, 'u' AS url")
     con.close()
+    monkeypatch.setattr(extract, "require_model", lambda client, model: None)
     monkeypatch.setattr(extract, "call_ollama", lambda text, model, client: ReleaseExtraction.model_validate(GOOD))
     extract.run(db, "m", None)
     con = duckdb.connect(db)
@@ -45,3 +46,34 @@ def test_traded_events_view(tmp_path, monkeypatch):
     assert row == ("Target Co.", "2023-06-05", "options")
     extract.run(db, "m", None)  # second run skips done rows
     assert con.execute("SELECT count(*) FROM extracted.release_extractions").fetchone()[0] == 1
+
+
+def test_failed_rows_are_retried(tmp_path, monkeypatch):
+    db = str(tmp_path / "t.duckdb")
+    con = duckdb.connect(db)
+    con.execute("CREATE SCHEMA raw")
+    con.execute("CREATE TABLE raw.sec_litigation_releases AS SELECT 1 AS lr_no, 'x' AS text, TRUE AS is_insider_candidate, 'u' AS url")
+    con.close()
+    monkeypatch.setattr(extract, "require_model", lambda client, model: None)
+
+    def boom(text, model, client):
+        raise httpx.HTTPError("404 model not found")
+    monkeypatch.setattr(extract, "call_ollama", boom)
+    extract.run(db, "m", None)
+    monkeypatch.setattr(extract, "call_ollama", lambda text, model, client: ReleaseExtraction.model_validate(GOOD))
+    extract.run(db, "m", None)
+    con = duckdb.connect(db)
+    assert con.execute("SELECT count(*), bool_and(ok) FROM extracted.release_extractions").fetchone() == (1, True)
+
+
+def test_require_model():
+    tags = {"models": [{"name": "qwen3:8b"}, {"name": "gemma4:26b"}, {"name": "llama3:latest"}]}
+    client = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json=tags)))
+    extract.require_model(client, "qwen3:8b")
+    extract.require_model(client, "llama3")
+    try:
+        extract.require_model(client, "qwen2.5:14b")
+    except SystemExit as err:
+        assert "qwen3:8b" in str(err) and "ollama pull qwen2.5:14b" in str(err)
+    else:
+        raise AssertionError("expected SystemExit")

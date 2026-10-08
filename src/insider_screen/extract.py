@@ -78,6 +78,17 @@ def call_ollama(text: str, model: str, client: httpx.Client) -> ReleaseExtractio
     raise last_err  # type: ignore[misc]
 
 
+def require_model(client: httpx.Client, model: str) -> None:
+    """Exit with the installed list if Ollama doesn't have `model`; a missing model 404s on every call."""
+    resp = client.get(f"{OLLAMA_URL}/api/tags", timeout=30)
+    resp.raise_for_status()
+    installed = sorted(m["name"] for m in resp.json().get("models", []))
+    want = model if ":" in model else f"{model}:latest"
+    if want not in installed:
+        raise SystemExit(f"model {model!r} isn't installed in Ollama. Installed: {', '.join(installed) or 'none'}. "
+                         f"Pull it with: ollama pull {model}")
+
+
 def run(db: str, model: str, limit: int | None) -> None:
     con = duckdb.connect(db)
     con.execute("CREATE SCHEMA IF NOT EXISTS extracted")
@@ -89,23 +100,30 @@ def run(db: str, model: str, limit: int | None) -> None:
     todo = con.execute(
         """SELECT r.lr_no, r.text FROM raw.sec_litigation_releases r
            WHERE r.is_insider_candidate
-             AND r.lr_no NOT IN (SELECT lr_no FROM extracted.release_extractions WHERE model = ?)
+             AND r.lr_no NOT IN (SELECT lr_no FROM extracted.release_extractions WHERE model = ? AND ok)
            ORDER BY r.lr_no""",
         [model],
     ).fetchall()
     if limit:
         todo = todo[:limit]
     print(f"{len(todo)} releases to extract with {model}")
+    failed: list[tuple[int, str]] = []
     with httpx.Client() as client:
+        if todo:
+            require_model(client, model)
         for i, (lr_no, text) in enumerate(todo, 1):
             try:
                 ext = call_ollama(text, model, client)
                 row = (lr_no, model, True, None, ext.model_dump_json())
             except (ValidationError, httpx.HTTPError, KeyError) as err:
                 row = (lr_no, model, False, str(err)[:500], None)
+                failed.append((lr_no, row[3]))
             con.execute("INSERT OR REPLACE INTO extracted.release_extractions VALUES (?, ?, ?, ?, ?)", row)
             if i % 25 == 0:
                 print(f"  {i}/{len(todo)}")
+    print(f"{len(todo) - len(failed)} extracted, {len(failed)} failed (retried on the next run)")
+    for lr_no, err in failed[:5]:
+        print(f"  LR {lr_no}: {err}")
     con.execute(
         """CREATE OR REPLACE VIEW extracted.traded_events AS
            SELECT x.lr_no, x.model,
