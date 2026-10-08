@@ -7,7 +7,7 @@ requests are needed.
 
 Event types (spec, "Events"):
 - earnings: 8-K with Item 2.02.
-- acquisition_target: the earliest 8-K with Item 1.01 filed within 120 days before the filer's
+- acquisition_target: the latest 8-K with Item 1.01 filed within 120 days before the filer's
   first target-side merger filing (PREM14A, DEFM14A, SC 14D9, SC14D9C, SC 13E3). Only targets
   file these, so the rule separates targets from acquirers without opening exhibits.
 - other_material_candidate: 8-K with Item 7.01 or 8.01 and neither 1.01 nor 2.02. The spec keeps
@@ -330,7 +330,10 @@ def build_events(db: str, start: str = "2016-01-01", end: str = "2025-12-31") ->
     deals = eightk[eightk.i101].merge(tf, on="cik", suffixes=("", "_t"))
     lag = (pd.to_datetime(deals.filing_date_t) - pd.to_datetime(deals.filing_date)).dt.days
     deals = deals[(lag >= 0) & (lag <= TARGET_WINDOW_DAYS)]
-    deals = deals.sort_values(["cik", "filing_date_t", "accepted_json"]).drop_duplicates(["cik", "filing_date_t"])
+    # latest 1.01 before the first target-side filing: an earlier 1.01 in the window is usually another
+    # agreement (a credit facility, say), not the merger agreement
+    deals = deals.sort_values(["cik", "filing_date_t", "filing_date", "accepted_json"]).drop_duplicates(
+        ["cik", "filing_date_t"], keep="last")
     events.append(deals.assign(
         event_type="acquisition_target",
         evidence=deals.form + " " + pd.to_datetime(deals.filing_date_t).dt.strftime("%Y-%m-%d"),

@@ -9,6 +9,7 @@
 4. Neither date, release says acquisition target: the CIK's only acquisition_target event. If it has
    several, those in a year named in the model's announcement quote ("2011 announcement"); a match
    needs exactly one left.
+Every path requires the event's day 0 to fall before the release date: trades come before charges.
 Unmatched releases are kept with a reason so the miss rate can be reported.
 
 Usage:
@@ -88,7 +89,12 @@ def match(traded: pd.DataFrame, companies: pd.DataFrame, events: pd.DataFrame,
         return int(sessions.searchsorted(d))  # non-session dates map to the next session
 
     rows = []
+    has_release_date = "release_date" in traded.columns
     for t in traded.itertuples(index=False):
+        if has_release_date and not pd.isna(t.release_date):
+            cutoff = pd.Timestamp(t.release_date)
+        else:
+            cutoff = None
         cik, method, score = resolve_cik(t.issuer_name, lookup, keys)
         base = {"lr_no": t.lr_no, "issuer_name": t.issuer_name, "announcement_date": t.announcement_date,
                 "release_event_type": t.event_type, "cik": cik, "name_method": method, "name_score": score,
@@ -97,7 +103,9 @@ def match(traded: pd.DataFrame, companies: pd.DataFrame, events: pd.DataFrame,
             rows.append({**base, "reason": method})
             continue
         cands = ev_by_cik.get(cik)
-        if cands is None:
+        if cands is not None and cutoff is not None:
+            cands = cands[pd.to_datetime(cands.day0) < cutoff]
+        if cands is None or cands.empty:
             rows.append({**base, "reason": "no_event_for_cik"})
             continue
         want = TYPE_MAP.get(t.event_type)
@@ -148,9 +156,9 @@ def run(db: str, model: str, edgar_db: str = EDGAR) -> pd.DataFrame:
     con = duckdb.connect(db)
     con.execute(f"ATTACH '{Path(edgar_db).as_posix()}' AS edgar (READ_ONLY)")
     traded = con.execute(
-        f"""SELECT DISTINCT lr_no, issuer_name, announcement_date, announcement_evidence, last_trade_date,
-                   event_type FROM {TABLE}
-           WHERE model = ? AND is_insider_trading_case""",
+        f"""SELECT DISTINCT t.lr_no, t.issuer_name, t.announcement_date, t.announcement_evidence, t.last_trade_date,
+                   t.event_type, r.release_date FROM {TABLE} t JOIN raw.sec_litigation_releases r USING (lr_no)
+           WHERE t.model = ? AND t.is_insider_trading_case""",
         [model_key(model)],
     ).df()
     companies = con.execute("SELECT cik, name, former_names FROM edgar.raw.edgar_companies").df()

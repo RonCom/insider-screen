@@ -138,3 +138,19 @@ def test_exact_times_override(tmp_path, monkeypatch):
     ev = edgar.build_events(db, start="2016-01-01", end="2025-12-31")
     tgt = ev[(ev.event_type == "acquisition_target")].iloc[0]
     assert (tgt.day0_basis, str(tgt.day0.date())) == ("index_header", "2023-06-06")
+
+
+def test_latest_101_before_target_form(tmp_path):
+    """A credit-agreement 8-K inside the 120-day window must not be taken for the merger agreement."""
+    import copy
+    tgt = copy.deepcopy(TARGET)
+    rows = list(zip(*[tgt["filings"]["recent"][k] for k in ["accessionNumber", "filingDate", "acceptanceDateTime", "form", "items"]]))
+    rows.append(("0001-23-000009", "2023-04-20", "2023-04-20T08:00:00.000Z", "8-K", "1.01,2.03"))
+    tgt["filings"]["recent"] = _filings(rows)
+    p = tmp_path / "s.zip"
+    with zipfile.ZipFile(p, "w") as zf:
+        zf.writestr("CIK0000001001.json", json.dumps(tgt))
+    db = str(tmp_path / "l.duckdb")
+    edgar.load(str(p), db)
+    ev = edgar.build_events(db, start="2016-01-01", end="2025-12-31")
+    assert ev[ev.event_type == "acquisition_target"].accession.tolist() == ["0001-23-000002"]

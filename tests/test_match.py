@@ -63,7 +63,8 @@ def test_run_reads_events_from_edgar_file(tmp_path):
     con.execute("CREATE TABLE events.announcements AS SELECT * FROM e")
     con.close()
     con = duckdb.connect(rel)
-    con.execute("CREATE SCHEMA extracted")
+    con.execute("CREATE SCHEMA extracted; CREATE SCHEMA raw")
+    con.execute("CREATE TABLE raw.sec_litigation_releases AS SELECT 1 AS lr_no, DATE '2022-03-01' AS release_date")
     con.execute(
         f"""CREATE TABLE {TABLE} AS SELECT 1 AS lr_no, 'Kindred Biosciences' AS issuer_name,
            DATE '2021-06-16' AS announcement_date, NULL::VARCHAR AS announcement_evidence, NULL::DATE AS last_trade_date, 'acquisition_target' AS event_type,
@@ -94,6 +95,14 @@ def test_target_disambiguated_by_quoted_year():
     out = match(traded("Kindred Biosciences", None, quote="the 2021 announcement of a merger"), COMPANIES, events, CAL).iloc[0]
     assert out.event_id == "acq-1"
 
+
 def test_missing_quote_as_nan():
     t = traded("Kindred Biosciences", None, quote=float("nan"))
+    assert match(t, COMPANIES, EVENTS, CAL).iloc[0].event_id == "acq-1"
+
+
+def test_event_after_release_is_not_matched():
+    t = traded("Kindred Biosciences", None).assign(release_date=pd.Timestamp("2021-05-01"))
+    assert match(t, COMPANIES, EVENTS, CAL).iloc[0].reason == "no_event_for_cik"  # deal came after the charges
+    t = traded("Kindred Biosciences", None).assign(release_date=pd.Timestamp("2022-05-01"))
     assert match(t, COMPANIES, EVENTS, CAL).iloc[0].event_id == "acq-1"
