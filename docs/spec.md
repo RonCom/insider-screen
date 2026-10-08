@@ -13,7 +13,7 @@ Across material announcements by US-listed companies from 2016 to 2025, which ev
 | SEC EDGAR 8-K filings | Event list and announcement timestamps | Free; declared User-Agent, 10 requests/second limit | Acceptance timestamps present for 2016–2025 |
 | SEC litigation releases | Insider-trading labels | Free, public domain | Count of insider-trading releases 2016–2026 |
 | FINRA Daily Short Sale Volume Files | Off-exchange short and total volume per symbol per day, 2015–2025 | Free | Files available back to 2015 at the CDN path |
-| FINRA Monthly Short Sale Transaction Files | Off-exchange short trades with size, 2015–2021 (FINRA lists none after 2021) | Free | Coverage of symbols that later delisted |
+| FINRA Monthly Short Sale Transaction Files | Off-exchange short trades with size, 2015–2025 | Free | Coverage of symbols that later delisted |
 | Massive (formerly Polygon) stocks | Daily and minute bars, total volume, delisted tickers | $29–79/mo | Delisted tickers return full history on trial |
 | Massive options | Daily option volume and prices by contract | Separate subscription | Expired contracts available back to 2016 |
 
@@ -45,7 +45,7 @@ If the Massive pre-checks fail, the options features are dropped and H2 is repor
 The pre-event window is days −20 to −1. The baseline window is days −250 to −31.
 
 - **Stock:** abnormal volume against the baseline; cumulative abnormal return from a market model fitted on the baseline; and the share of volume in the last 5 days of the window.
-- **Off-exchange (FINRA):** short-sale share of off-exchange volume against the baseline, from the daily files. Short-sale trade counts and the share of trades of 100 shares or fewer come from the monthly files, which end in 2021, so they're reported as a development-period diagnostic and kept out of the test-period scores.
+- **Off-exchange (FINRA):** short-sale share of off-exchange volume against the baseline, from the daily files. Short-sale trade counts and the share of trades of 100 shares or fewer, from the monthly transaction files.
 - **Options:** total volume against the baseline; out-of-the-money call volume share (put share for negative events); share of volume in contracts expiring within 30 days of day 0; and the change in at-the-money implied volatility.
 - **Peer benchmarking:** every feature is expressed against events of the same type, market-cap quintile and sector.
 - **Shrinkage:** an empirical-Bayes adjustment pulls estimates for stocks with fewer than 20 baseline days of options trading toward their peer group.
@@ -99,3 +99,4 @@ uv, DuckDB, dbt with a Snowflake target, MLflow for runs, Streamlit alert queue 
 | Date | Change | Reason |
 | --- | --- | --- |
 | 2026-10-08 | Off-exchange short share from the daily files; trade-size features development-only | FINRA's TRF pages list monthly transaction files only through 2021, and its ADF files are empty after January 2015. Seen before any data pull. |
+| 2026-10-08 | Previous change reversed: trade-size features return for all years | FINRA's data catalog lists the monthly files for 2009 through 2026 at a new location (cdn.finra.org); the old TRF pages were out of date. Found the same day, before any data pull. |

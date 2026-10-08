@@ -60,7 +60,7 @@ uv run python -m insider_screen.shortsale probe
 # 2. Daily short and total off-exchange volume per symbol (raw.finra_short_daily); about 2,750 sessions at 2 requests/second
 uv run python -m insider_screen.shortsale daily --start 2015-01-01 --end 2025-12-31
 
-# 3. Optional, development years only: trade-level files aggregated to daily counts (raw.finra_short_trades_daily).
-#    Each Nasdaq TRF month is ~400-600 MB zipped; files are streamed, aggregated and deleted.
-uv run python -m insider_screen.shortsale monthly --start 2015-01 --end 2021-12
+# 3. Trade-level files aggregated to daily counts (raw.finra_short_trades_daily); streamed, aggregated and deleted.
+#    Nasdaq TRF months are split into parts; August 2026 was four files of about 1 GB each. Plan for a long run.
+uv run python -m insider_screen.shortsale monthly --start 2015-01 --end 2025-12
 ```

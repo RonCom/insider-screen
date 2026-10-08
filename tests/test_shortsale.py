@@ -72,3 +72,16 @@ Q|BBB|20160302|10:00:00|E|50|5.0|A
     df = ss.aggregate_monthly(io.StringIO(text))
     aaa = df[df.symbol == "AAA"].iloc[0]
     assert (aaa.short_trades, aaa.short_shares, aaa.small_trades) == (2, 600, 1)
+
+
+def test_find_parts_and_labels():
+    existing = {
+        "https://cdn.finra.org/equity/regsho/monthly/FNYXsh201603.zip",
+        "https://cdn.finra.org/equity/regsho/monthly/FNSQsh202608_1.zip",
+        "https://cdn.finra.org/equity/regsho/monthly/FNSQsh202608_2.zip",
+    }
+    head = lambda url: 200 if url in existing else 403  # noqa: E731
+    assert ss.find_parts(head, "FNYX", 2016, 3) == ["https://cdn.finra.org/equity/regsho/monthly/FNYXsh201603.zip"]
+    parts = ss.find_parts(head, "FNSQ", 2026, 8)
+    assert [ss.part_label(u) for u in parts] == ["FNSQ_1", "FNSQ_2"]
+    assert ss.find_parts(head, "FNQC", 2016, 3) == []

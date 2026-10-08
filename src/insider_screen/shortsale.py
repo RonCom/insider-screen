@@ -7,20 +7,22 @@ Date|Symbol|ShortVolume|ShortExemptVolume|TotalVolume|Market, with a header row 
 - Before that: FNSQ (Nasdaq TRF) and FNYX (NYSE TRF) summed by symbol. FNQC (Nasdaq TRF Chicago)
   starts 2018-09-10, after the consolidated file, so it's never needed.
 
-Monthly Short Sale Transaction Files (trade-level) at regsho.finra.org/<FACILITY>sh<YYYYMM>.txt.zip.
-FINRA's TRF pages list them only through 2021, so the trade-size features cover the
-development years only. The ADF files are empty after January 2015 and are skipped.
+Monthly Short Sale Transaction Files (trade-level) at cdn.finra.org/equity/regsho/monthly/, listed
+on FINRA's data catalog for 2009 through the latest month. Large facilities are split into parts:
+August 2026 has FNSQsh202608_1.zip to _4.zip (about 1 GB each). The old regsho.finra.org links
+redirect to the catalog page. ADF files are empty after January 2015 and are skipped.
 
 Usage:
     uv run python -m insider_screen.shortsale probe
     uv run python -m insider_screen.shortsale daily --start 2015-01-01 --end 2025-12-31
-    uv run python -m insider_screen.shortsale monthly --start 2015-01 --end 2021-12
+    uv run python -m insider_screen.shortsale monthly --start 2015-01 --end 2025-12
 """
 
 from __future__ import annotations
 
 import argparse
 import io
+import re
 import tempfile
 import zipfile
 from datetime import date
@@ -34,7 +36,8 @@ import pandas as pd
 from insider_screen.http import DEFAULT_USER_AGENT, PoliteClient
 
 DAILY_URL = "https://cdn.finra.org/equity/regsho/daily/{fac}shvol{d:%Y%m%d}.txt"
-MONTHLY_URL = "http://regsho.finra.org/{fac}sh{y}{m:02d}.txt.zip"
+MONTHLY_BASE = "https://cdn.finra.org/equity/regsho/monthly/"
+MAX_PARTS = 9
 CNMS_START = date(2018, 8, 1)
 PRE_CNMS = ["FNSQ", "FNYX"]
 MONTHLY_FACILITIES = ["FNSQ", "FNYX", "FNQC"]
@@ -110,17 +113,51 @@ def load_daily(client: PoliteClient, db: str, start: str, end: str) -> None:
         print(f"{len(missing)} sessions with no file, first few: {missing[:10]}")
 
 
+def find_parts(head, fac: str, y: int, m: int) -> list[str]:
+    """URLs for one facility-month: the single file if present, else _1, _2, ... until one is missing.
+    `head(url)` returns an HTTP status."""
+    single = f"{MONTHLY_BASE}{fac}sh{y}{m:02d}.zip"
+    if head(single) == 200:
+        return [single]
+    parts = []
+    for k in range(1, MAX_PARTS + 1):
+        url = f"{MONTHLY_BASE}{fac}sh{y}{m:02d}_{k}.zip"
+        if head(url) != 200:
+            break
+        parts.append(url)
+    return parts
+
+
+def part_label(url: str) -> str:
+    """'.../FNSQsh202608_1.zip' -> 'FNSQ_1'; '.../FNYXsh202608.zip' -> 'FNYX'."""
+    m = re.match(r"([A-Z]{4})sh\d{6}(_\d+)?\.zip$", url.rsplit("/", 1)[1])
+    return m.group(1) + (m.group(2) or "")
+
+
+def _head_client() -> httpx.Client:
+    return httpx.Client(headers={"User-Agent": DEFAULT_USER_AGENT}, follow_redirects=False, timeout=30)
+
+
 def probe(client: PoliteClient) -> None:
     for d in [date(2016, 3, 1), date(2018, 7, 31), date(2018, 8, 1), date(2021, 6, 1), date(2025, 6, 2)]:
         for fac in facilities_for(d):
             url = DAILY_URL.format(fac=fac, d=d)
             status, body = client.get(url, use_cache=False, store=False)
             print(f"{status} {len(body):>9,} bytes  {url}")
-    for y, m in [(2016, 3), (2021, 12), (2022, 1)]:
-        url = MONTHLY_URL.format(fac="FNSQ", y=y, m=m)
-        with httpx.Client(headers={"User-Agent": DEFAULT_USER_AGENT}, follow_redirects=True) as c:
+    with _head_client() as c:
+        sizes = {}
+
+        def head(url: str) -> int:
             r = c.head(url)
-        print(f"{r.status_code} {r.headers.get('content-length', '?'):>12} bytes  {url}")
+            sizes[url] = r.headers.get("content-length", "?")
+            return r.status_code
+
+        for fac, y, m in [("FNSQ", 2016, 3), ("FNYX", 2016, 3), ("FNSQ", 2021, 12), ("FNSQ", 2025, 12),
+                          ("FNQC", 2025, 12)]:
+            parts = find_parts(head, fac, y, m)
+            shown = ", ".join(f"{u.rsplit('/', 1)[1]} ({int(sizes[u]) / 1e6:,.0f} MB)" if sizes[u] != "?"
+                              else u.rsplit("/", 1)[1] for u in parts)
+            print(f"{fac} {y}-{m:02d}: {len(parts)} file(s) {shown}")
 
 
 def aggregate_monthly(lines: io.TextIOBase) -> pd.DataFrame:
@@ -173,13 +210,17 @@ def load_monthly(db: str, start: str, end: str, keep_zips: bool = False) -> None
         "SELECT DISTINCT facility, file_month FROM raw.finra_short_trades_daily").fetchall()}
     zdir = Path("data/finra_monthly")
     zdir.mkdir(parents=True, exist_ok=True)
-    with httpx.Client(headers={"User-Agent": DEFAULT_USER_AGENT}, follow_redirects=True, timeout=None) as c:
+    with httpx.Client(headers={"User-Agent": DEFAULT_USER_AGENT}, follow_redirects=False, timeout=None) as c:
+        head = lambda url: c.head(url).status_code  # noqa: E731
         while (y, m) <= (ey, em):
             month = f"{y}-{m:02d}"
-            for fac in MONTHLY_FACILITIES:
+            urls = [u for fac in MONTHLY_FACILITIES for u in find_parts(head, fac, y, m)]
+            if not urls:
+                print(f"  {month}: no files found")
+            for url in urls:
+                fac = part_label(url)
                 if (fac, month) in done:
                     continue
-                url = MONTHLY_URL.format(fac=fac, y=y, m=m)
                 with tempfile.NamedTemporaryFile(dir=zdir, suffix=".zip", delete=False) as tmp:
                     with c.stream("GET", url) as r:
                         status = r.status_code
@@ -202,7 +243,7 @@ def load_monthly(db: str, start: str, end: str, keep_zips: bool = False) -> None
                 con.unregister("df")
                 print(f"  {month} {fac}: {len(df):,} symbol-days")
                 if keep_zips:
-                    path.rename(zdir / Path(url).name)
+                    path.rename(zdir / url.rsplit("/", 1)[1])
                 else:
                     path.unlink()
             y, m = (y + 1, 1) if m == 12 else (y, m + 1)
@@ -220,7 +261,7 @@ def main() -> None:
     mo = sub.add_parser("monthly")
     mo.add_argument("--db", default="data/insider.duckdb")
     mo.add_argument("--start", default="2015-01")
-    mo.add_argument("--end", default="2021-12")
+    mo.add_argument("--end", default="2025-12")
     mo.add_argument("--keep-zips", action="store_true")
     a = ap.parse_args()
     client = PoliteClient(cache_dir="data/cache/finra", max_per_second=2.0)
