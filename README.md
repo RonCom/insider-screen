@@ -35,6 +35,10 @@ uv run python -m insider_screen.db split
 # 1. Download and parse releases from 2016 on (roughly 3,000-4,000 pages at 5 requests/second: 10-15 minutes the first run, cached after)
 uv run python -m insider_screen.sec_releases --since 2016-01-01
 
+# Release dates are read from the header line; the run lists any missing or out of sequence with
+# neighbouring release numbers. After a parser change, re-read dates from the stored text (no download):
+uv run python -m insider_screen.sec_releases --fix-dates
+
 # 2. Extract traded events from insider-trading candidates with a local model (Ollama running).
 #    On an 8 GB GPU: set OLLAMA_FLASH_ATTENTION=1 and OLLAMA_KV_CACHE_TYPE=q8_0 for Ollama itself (setx, then
 #    restart Ollama), and OLLAMA_NUM_CTX=5120 and OLLAMA_THINK=false in .env for qwen3:8b.

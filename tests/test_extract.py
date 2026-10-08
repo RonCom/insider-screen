@@ -47,7 +47,7 @@ def test_date_checks():
 def test_clean_merges_and_drops():
     rows = clean_events(ext([
         ev(),
-        ev(instruments="stock", event_type="other", announcement_date=None, announcement_evidence=None),
+        ev(instruments="stock", event_type="unknown", announcement_date=None, announcement_evidence=None),
         ev(issuer_name="pharmaceutical company"),
         ev(issuer_name="Target Co"),  # same issuer, punctuation differs
     ]), TEXT)
@@ -82,7 +82,7 @@ def test_run_writes_clean_rows(tmp_path, monkeypatch):
     extract.run(db, "m", None)  # second run skips done releases
     con = duckdb.connect(db)
     rows = con.execute("SELECT model, issuer_name, announcement_date::VARCHAR, date_check FROM extracted.traded_events").fetchall()
-    assert rows == [("m#v4", "Target Co.", "2023-06-05", "verified")]
+    assert rows == [(extract.model_key("m"), "Target Co.", "2023-06-05", "verified")]
 
 
 def test_trade_date_verified_and_latest_kept():
@@ -118,7 +118,8 @@ def test_run_works_on_table_without_primary_key(tmp_path, monkeypatch):
     con.execute("CREATE SCHEMA raw; CREATE SCHEMA extracted")
     con.execute("CREATE TABLE raw.sec_litigation_releases AS SELECT 1 AS lr_no, ? AS text, TRUE AS is_insider_candidate, 'u' AS url", [TEXT])
     con.execute("""CREATE TABLE extracted.release_extractions AS
-                   SELECT 1 AS lr_no, 'm#v4' AS model, FALSE AS ok, 'timed out' AS error, NULL::JSON AS payload""")
+                   SELECT 1 AS lr_no, ? AS model, FALSE AS ok, 'timed out' AS error, NULL::JSON AS payload""",
+                [extract.model_key("m")])
     con.close()
     monkeypatch.setattr(extract, "call_ollama", lambda text, model, client: ext([ev()]))
     extract.run(db, "m", None)
@@ -147,3 +148,59 @@ def test_reclean_rebuilds_from_stored_output(tmp_path, monkeypatch):
     extract.reclean(db, "m")
     con = duckdb.connect(db)
     assert con.execute(f"SELECT issuer_name FROM {extract.TABLE}").fetchall() == [("Target Co.",)]
+
+
+def test_two_announcements_for_one_issuer_stay_separate():
+    text = TEXT + " On January 2, 2023 Target Co. announced a license agreement with Gamma Inc."
+    rows = clean_events(ext([
+        ev(),
+        ev(event_type="other", announcement_date="2023-01-02",
+           announcement_evidence="On January 2, 2023 Target Co. announced a license agreement"),
+    ]), text)
+    assert sorted((r["event_type"], str(r["announcement_date"])) for r in rows) == [
+        ("acquisition_target", "2023-06-05"), ("other", "2023-01-02")]
+    # same type, different verified dates: two earnings releases
+    rows = clean_events(ext([
+        ev(event_type="earnings"),
+        ev(event_type="earnings", announcement_date="2023-01-02",
+           announcement_evidence="On January 2, 2023 Target Co. announced a license agreement"),
+    ]), text)
+    assert len(rows) == 2
+
+
+def test_acquirer_dropped_when_target_present():
+    rows = clean_events(ext([ev(), ev(issuer_name="Buyer Inc.", event_type="acquirer")]), TEXT)
+    assert [r["issuer_name"] for r in rows] == ["Target Co."]
+    rows = clean_events(ext([ev(issuer_name="Buyer Inc.", event_type="acquirer")]), TEXT)
+    assert [r["issuer_name"] for r in rows] == ["Buyer Inc."]
+
+
+def test_instruments_checked_against_release():
+    from insider_screen.extract import check_instruments
+    securities = "Penna traded in the securities of each of the three companies."
+    assert check_instruments("stock", securities) == ("unknown", "stock_not_in_release")
+    assert check_instruments("unknown", securities) == ("unknown", "ok")
+    employee = "Ying exercised all of his vested Equifax stock options and then sold the shares."
+    assert check_instruments("options", employee) == ("stock", "employee_options")
+    assert check_instruments("stock", employee) == ("stock", "ok")
+    calls = "He bought 200 call options and later sold his shares."
+    assert check_instruments("both", calls) == ("both", "ok")
+    assert check_instruments("options", "Doe bought QLogic call options.") == ("options", "ok")
+    assert check_instruments("both", "Doe bought QLogic call options.") == ("options", "both_not_in_release")
+
+
+def test_sell_direction_accepted():
+    e = ext([ev(direction="sell", instruments="stock")]).events[0]
+    assert e.direction == "sell"
+
+
+def test_trade_dates_split_only_when_far_apart():
+    text = TEXT + " Doe bought on May 20, 2023 and again on June 1, 2023. Earlier he bought on January 3, 2023."
+    def tev(d, q):
+        return ev(announcement_date=None, announcement_evidence=None, last_trade_date=d, trade_evidence=q)
+    rows = clean_events(ext([tev("2023-05-20", "Doe bought on May 20, 2023"),
+                             tev("2023-06-01", "again on June 1, 2023")]), text)
+    assert [str(r["last_trade_date"]) for r in rows] == ["2023-06-01"]
+    rows = clean_events(ext([tev("2023-06-01", "again on June 1, 2023"),
+                             tev("2023-01-03", "Earlier he bought on January 3, 2023")]), text)
+    assert len(rows) == 2

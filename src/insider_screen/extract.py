@@ -5,7 +5,12 @@ then checked against the release text before it's stored:
 - an event needs a named issuer (at least one capitalized word; "a pharmaceutical company" is dropped);
 - announcement_date is kept only if the model's quoted evidence appears in the release and states
   that full date (month, day and year); otherwise it's set to null and date_check records why;
-- events for the same issuer within a release are merged (instruments and directions combined);
+- events for the same issuer within a release are merged unless they conflict (different event types,
+  different verified announcement dates, or verified last-trade dates more than 30 days apart), so two
+  announcements for one issuer stay two rows;
+- instruments are checked against the release: stock needs a mention of stock or shares, options a mention
+  of options, calls or puts; employee options that were exercised and sold count as stock;
+- an acquirer event is dropped when the same release has a target event (the target is what was traded);
 - last_trade_date gets the same quote check; the matcher uses it when the announcement date is missing.
 
 Runs are keyed by model and PROMPT_VERSION, so a prompt change re-extracts without deleting old rows.
@@ -38,7 +43,7 @@ from insider_screen.db import RELEASES
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:8b")
-PROMPT_VERSION = "v4"
+PROMPT_VERSION = "v5"
 NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "8192"))
 THINK = {"true": True, "false": False}.get(os.environ.get("OLLAMA_THINK", "").lower())
 TABLE = f"extracted.traded_events_{PROMPT_VERSION}"
@@ -59,7 +64,7 @@ class TradedEvent(BaseModel):
         None, description="Exact sentence fragment from the release, at most 40 words, that states that trade date")
     event_type: EventType
     instruments: Literal["stock", "options", "both", "other", "unknown"]
-    direction: Literal["long", "short", "both", "unknown"]
+    direction: Literal["long", "short", "sell", "both", "unknown"]
 
 
 class ReleaseExtraction(BaseModel):
@@ -81,10 +86,15 @@ release_kind:
 - criminal_outcome: the release reports a guilty plea, conviction or sentence in a parallel criminal case.
 - other: anything else.
 
-events: one per issuer whose securities were traded. The issuer is the company whose stock or options
-the defendants bought or sold. It is not the defendant's employer, and not the source of the information,
-unless that company's own securities were traded. Example: an analyst at a bank who used card data to
-trade retailers' stock before their earnings: the issuers are the retailers, not the bank.
+events: one per announcement the defendants traded ahead of. If they traded one issuer ahead of two
+different announcements (two earnings releases, a license deal and later an acquisition), return two events.
+List every named issuer that was traded, including ones mentioned in a single sentence.
+The issuer is the company whose stock or options the defendants bought or sold. It is not the defendant's
+employer, and not the source of the information, unless that company's own securities were traded.
+Example: an analyst at a bank who used card data to trade retailers' stock before their earnings: the issuers
+are the retailers, not the bank. In an acquisition the traded issuer is almost always the company being
+bought; return the buyer only if the release says the defendants traded the buyer's own securities.
+Example: "trading ahead of Lumentum's acquisition of Coherent" -> issuer Coherent, not Lumentum.
 Skip issuers the release doesn't name (e.g. "a pharmaceutical company"). Use the company's name as written.
 
 event_type, from the news traded on:
@@ -93,7 +103,9 @@ event_type, from the news traded on:
 - earnings: quarterly or annual results, or guidance.
 - clinical_or_regulatory: drug trial results, FDA or other regulatory decisions.
 - financing: a securities offering or financing.
-- other: any other named news. unknown: the release doesn't say.
+- other: any other named news, including license, collaboration, supply or sales agreements between
+  companies (these are not acquisitions, even between drug companies). unknown: the release doesn't say.
+A SPAC that agrees to merge with a private company is the acquirer.
 
 announcement_date: the date the news became public, only if the release states the full date
 (month, day and year). If it gives only a month or year, or no date, return null.
@@ -102,9 +114,17 @@ announcement_evidence: copy the words from the release that state that date, unc
 last_trade_date: the last date the release says the defendants traded that issuer before the news,
 only if it states the full date. trade_evidence: copy the words that state it, unchanged.
 
-instruments: stock, options, or both. direction: the position taken before the news, ignoring the sale
-or cover that closed it afterward. long for buying stock or call options; short for short sales or buying
-puts; both only if the defendants took long and short positions in that issuer before the news.
+instruments: what the release says was traded. stock if it says stock, shares or ADRs; options if it says
+options, calls or puts; both if it says both. If it says only "securities" or "traded", return unknown;
+don't guess. Employee stock options that were exercised and the shares sold are stock, not options.
+
+direction: the position taken before the news, ignoring the sale or cover that closed it afterward.
+- long: bought stock or call options.
+- short: short sales or bought put options. Only these.
+- sell: sold shares the defendant already owned (including shares from exercised employee options),
+  usually to avoid a loss before bad news. This is not short.
+- both: long and short (or sell) positions in that issuer before the same news.
+- unknown: the release doesn't say which way they traded.
 
 Example. Release text: "...Doe bought call options in Acme Corp. ahead of the March 4, 2019 announcement
 that Acme would be acquired by Beta Inc..." Event: issuer_name "Acme Corp.", announcement_date 2019-03-04,
@@ -197,19 +217,54 @@ def is_named(issuer: str | None) -> bool:
     return bool(NAMED_RE.search(issuer)) and not (UNNAMED_RE.match(issuer) and issuer[0].islower())
 
 
-def _combine(values: list[str], both: str = "both") -> str:
+def _combine(values: list[str]) -> str:
     known = {v for v in values if v not in ("unknown",)}
     if not known:
         return "unknown"
     if len(known) == 1:
         return known.pop()
-    if known <= {"stock", "options", "both"} or known <= {"long", "short", "both"}:
-        return both
+    if known <= {"stock", "options", "both"} or known <= {"long", "short", "sell", "both"}:
+        return "both"
     return "other"
 
 
+STOCK_RE = re.compile(
+    r"\bstocks?\b(?!\s*(?:-\s*)?(?:broker|price|market|exchange|options?|trading plan|purchase plan))"
+    r"|\bshares?\b(?!\s+(?:price|rose|fell|increased|decreased|dropped|jumped|climbed|declined))"
+    r"|\bADRs?\b|\bADSs?\b|American Deposit[ao]ry", re.I)
+EMPLOYEE_OPTION_RE = re.compile(
+    r"\b(?:vested|employee|exercis\w*)\b[^.]{0,60}?\b(?:stock )?options?\b", re.I)
+OPTION_RE = re.compile(r"\boptions?\b|\b(?:call|put)s\b", re.I)
+
+
+def check_instruments(value: str, text: str) -> tuple[str, str]:
+    """Hold the model's instrument to what the release says. Returns (instruments, reason).
+    Employee options that were exercised count as stock, so they're removed before looking for options."""
+    stock = bool(STOCK_RE.search(text))
+    employee = bool(EMPLOYEE_OPTION_RE.search(text))
+    options = bool(OPTION_RE.search(EMPLOYEE_OPTION_RE.sub(" ", text)))
+    if value == "options" and not options:
+        return ("stock", "employee_options") if employee else ("unknown", "options_not_in_release")
+    if value == "stock" and not stock:
+        return "unknown", "stock_not_in_release"
+    if value == "both" and not (stock and options):
+        return ("stock" if stock else "options" if options else "unknown"), "both_not_in_release"
+    return value, "ok"
+
+
+def _dates_conflict(a: date | None, b: date | None, days: int = 0) -> bool:
+    return a is not None and b is not None and abs((a - b).days) > days
+
+
+TRADE_GAP_DAYS = 30  # purchases weeks apart can precede one deal; further apart, separate news
+
+
+def _types_conflict(a: str, b: str) -> bool:
+    return a != b and "unknown" not in (a, b)
+
+
 def clean_events(ext: ReleaseExtraction, text: str) -> list[dict]:
-    rows: dict[str, dict] = {}
+    rows: list[dict] = []
     for ev in ext.events:
         ev = ev.model_copy(update={"issuer_name": clean_issuer(ev.issuer_name)})
         if not is_named(ev.issuer_name):
@@ -217,30 +272,35 @@ def clean_events(ext: ReleaseExtraction, text: str) -> list[dict]:
         d, why = check_date(ev, text)
         td, twhy = verify_date(ev.last_trade_date, ev.trade_evidence, text)
         key = _norm(re.sub(r"[^\w\s]", "", ev.issuer_name))
-        row = rows.get(key)
+        row = next((r for r in rows if r["key"] == key
+                    and not _types_conflict(r["event_type"], ev.event_type)
+                    and not _dates_conflict(r["announcement_date"], d)
+                    and not _dates_conflict(r["last_trade_date"], td, TRADE_GAP_DAYS)), None)
         if row is None:
-            rows[key] = {
-                "issuer_name": ev.issuer_name.strip(), "ticker": ev.ticker,
+            rows.append({
+                "key": key, "issuer_name": ev.issuer_name.strip(), "ticker": ev.ticker,
                 "announcement_date": d, "date_check": why, "announcement_evidence": ev.announcement_evidence,
                 "last_trade_date": td, "trade_check": twhy, "trade_evidence": ev.trade_evidence,
-                "event_types": [ev.event_type], "instruments": [ev.instruments], "directions": [ev.direction],
-            }
-        else:
-            row["event_types"].append(ev.event_type)
-            row["instruments"].append(ev.instruments)
-            row["directions"].append(ev.direction)
-            if row["announcement_date"] is None and d is not None:
-                row.update(announcement_date=d, date_check=why, announcement_evidence=ev.announcement_evidence)
-            if td is not None and (row["last_trade_date"] is None or td > row["last_trade_date"]):
-                row.update(last_trade_date=td, trade_check=twhy, trade_evidence=ev.trade_evidence)
-    out = []
-    for r in rows.values():
-        types = [t for t in r.pop("event_types") if t not in ("other", "unknown")]
-        r["event_type"] = types[0] if types else "other"
-        r["instruments"] = _combine(r.pop("instruments"))
+                "event_type": ev.event_type, "instruments": [ev.instruments], "directions": [ev.direction],
+            })
+            continue
+        row["instruments"].append(ev.instruments)
+        row["directions"].append(ev.direction)
+        if row["event_type"] == "unknown":
+            row["event_type"] = ev.event_type
+        if row["announcement_date"] is None and d is not None:
+            row.update(announcement_date=d, date_check=why, announcement_evidence=ev.announcement_evidence)
+        if td is not None and (row["last_trade_date"] is None or td > row["last_trade_date"]):
+            row.update(last_trade_date=td, trade_check=twhy, trade_evidence=ev.trade_evidence)
+    if any(r["event_type"] == "acquisition_target" for r in rows):
+        rows = [r for r in rows if r["event_type"] != "acquirer"]
+    for r in rows:
+        r.pop("key")
+        if r["event_type"] == "unknown":
+            r["event_type"] = "other"
+        r["instruments"], r["instruments_check"] = check_instruments(_combine(r.pop("instruments")), text)
         r["direction"] = _combine(r.pop("directions"))
-        out.append(r)
-    return out
+    return rows
 
 
 def _record(con, row: tuple) -> None:
@@ -248,6 +308,19 @@ def _record(con, row: tuple) -> None:
     primary key; `db split` copies tables with CREATE TABLE AS, which drops constraints."""
     con.execute("DELETE FROM extracted.release_extractions WHERE lr_no = ? AND model = ?", [row[0], row[1]])
     con.execute("INSERT INTO extracted.release_extractions VALUES (?, ?, ?, ?, ?)", row)
+
+
+def _insert_events(con, lr_no: int, key: str, ext: ReleaseExtraction, text: str) -> int:
+    events = clean_events(ext, text)
+    for ev in events:
+        con.execute(
+            f"INSERT INTO {TABLE} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [lr_no, key, ext.release_kind, ext.is_insider_trading_case, ev["issuer_name"], ev["ticker"],
+             ev["announcement_date"], ev["date_check"], ev["announcement_evidence"],
+             ev["last_trade_date"], ev["trade_check"], ev["trade_evidence"], ev["event_type"],
+             ev["instruments"], ev["instruments_check"], ev["direction"]],
+        )
+    return len(events)
 
 
 def run(db: str, model: str, limit: int | None) -> None:
@@ -264,7 +337,7 @@ def run(db: str, model: str, limit: int | None) -> None:
             lr_no INTEGER, model VARCHAR, release_kind VARCHAR, is_insider_trading_case BOOLEAN,
             issuer_name VARCHAR, ticker VARCHAR, announcement_date DATE, date_check VARCHAR,
             announcement_evidence VARCHAR, last_trade_date DATE, trade_check VARCHAR, trade_evidence VARCHAR,
-            event_type VARCHAR, instruments VARCHAR, direction VARCHAR)"""
+            event_type VARCHAR, instruments VARCHAR, instruments_check VARCHAR, direction VARCHAR)"""
     )
     todo = con.execute(
         """SELECT r.lr_no, r.text FROM raw.sec_litigation_releases r
@@ -285,14 +358,7 @@ def run(db: str, model: str, limit: int | None) -> None:
                 continue
             _record(con, (lr_no, key, True, None, ext.model_dump_json()))
             con.execute(f"DELETE FROM {TABLE} WHERE lr_no = ? AND model = ?", [lr_no, key])
-            for ev in clean_events(ext, text):
-                con.execute(
-                    f"INSERT INTO {TABLE} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    [lr_no, key, ext.release_kind, ext.is_insider_trading_case, ev["issuer_name"], ev["ticker"],
-                     ev["announcement_date"], ev["date_check"], ev["announcement_evidence"],
-                     ev["last_trade_date"], ev["trade_check"], ev["trade_evidence"], ev["event_type"],
-                     ev["instruments"], ev["direction"]],
-                )
+            _insert_events(con, lr_no, key, ext, text)
             if i % 25 == 0:
                 print(f"  {i}/{len(todo)}")
     con.execute(f"CREATE OR REPLACE VIEW extracted.traded_events AS SELECT * FROM {TABLE}")
@@ -328,15 +394,7 @@ def reclean(db: str, model: str) -> None:
     n = 0
     for lr_no, payload, text in rows:
         ext = ReleaseExtraction.model_validate_json(payload)
-        for ev in clean_events(ext, text):
-            con.execute(
-                f"INSERT INTO {TABLE} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [lr_no, key, ext.release_kind, ext.is_insider_trading_case, ev["issuer_name"], ev["ticker"],
-                 ev["announcement_date"], ev["date_check"], ev["announcement_evidence"],
-                 ev["last_trade_date"], ev["trade_check"], ev["trade_evidence"], ev["event_type"],
-                 ev["instruments"], ev["direction"]],
-            )
-            n += 1
+        n += _insert_events(con, lr_no, key, ext, text)
     con.close()
     print(f"Rebuilt {n} events from {len(rows)} stored extractions for {key}")
 
@@ -349,7 +407,7 @@ def sample(db: str, model: str, out: str, n: int = 100, seed: int = 42) -> None:
     con = duckdb.connect(db, read_only=True)
     df = con.execute(
         f"""SELECT r.lr_no, r.url, t.issuer_name, t.announcement_date, t.date_check, t.last_trade_date,
-                  t.event_type, t.instruments, t.direction
+                  t.event_type, t.instruments, t.instruments_check, t.direction
            FROM {TABLE} t JOIN raw.sec_litigation_releases r USING (lr_no)
            WHERE t.model = ?""",
         [model_key(model)],

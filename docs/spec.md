@@ -36,7 +36,7 @@ No free source has expired option contracts back to 2017, so the options feature
    - issuer name, and ticker if stated
    - announcement date
    - instrument (stock, options, or both)
-   - direction (long or short)
+   - direction (long, short, or sell: shares already held sold before bad news)
    - trade dates if stated
 2. **Hand-check:** check 100 releases by hand. The gate is ≥90% field accuracy on issuer and announcement date; below that, fix the prompt or schema and re-check before going further.
 3. **Matching:** match releases to events by issuer CIK and announcement date within ±3 trading days. Unmatched releases are listed with a reason.
@@ -106,3 +106,5 @@ uv, DuckDB, dbt with a Snowflake target, MLflow for runs, Streamlit alert queue 
 | 2026-10-08 | Development period starts in 2017 (was 2016); question range is 2017–2025 | Alpaca's history starts in January 2016 (a request for January 2015 returned no bars), so 2016 events have no full −250-day baseline. Test period unchanged. Before any price data pull. |
 | 2026-10-08 | Options features and shrinkage dropped; H2 and H4 reported as not tested | No free source of expired option contracts back to 2017 (Twelve Data, Yahoo Finance, Interactive Brokers and Alpaca checked); the spec's fallback for a failed options pre-check. Before any price data pull. |
 | 2026-10-08 | Day 0 from index headers for acquisition targets; earliest consistent day 0 for other events | A check of 90 bulk-file times against filing index headers found offsets of 0, 4–5 and 8–10 hours from Eastern time in both parts of the bulk file. Before any feature was computed. |
+| 2026-10-08 | Direction adds `sell` (shares already held, sold before bad news); `short` is short sales and puts only | The first hand-check pass found 11 of 100 releases where defendants sold held shares to avoid a loss, which neither long nor short describes. A sale shows in trading data as selling, not short selling. Before any event was matched. |
+| 2026-10-08 | Hand-check done as a model-assisted first pass, then every row reviewed by hand | The release pages couldn't be fetched in the environment used; a second model filled the first pass from the stored release texts. The person running the study reviews all rows against the releases before scoring. |

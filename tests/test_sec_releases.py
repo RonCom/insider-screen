@@ -57,3 +57,46 @@ def test_tipping_without_insider_phrases():
     ).replace("ahead of the\nJune 5, 2023 announcement", "before June 5, 2023")
     assert "insider" not in page.lower() and "nonpublic" not in page.lower()
     assert parse_release(page, 25999).is_insider_candidate
+
+
+def test_header_date_variants():
+    from insider_screen.sec_releases import date_from_text
+    assert date_from_text("Litigation Release No. 24498 / June 11. 2019\nSEC v. X") == date(2019, 6, 11)
+    assert date_from_text("Litigation Release No. 24713 / January 13 2020\nSEC v. X\n, No. 3:18-cv-01135 (D. Conn. filed July 10, 2018)") == date(2020, 1, 13)
+    assert date_from_text("Litigation Release No. 26197 / Dec. 18, 2024\nSEC v. X") == date(2024, 12, 18)
+    assert date_from_text("Litigation Release No. 24035/ January 26, 2018") == date(2018, 1, 26)
+    assert date_from_text("Litigation Release No. 25001 / Sept. 5, 2019") == date(2019, 9, 5)
+    assert date_from_text("Litigation Release No. 25999\nMarch 3, 2024\nSEC v. X") == date(2024, 3, 3)
+    # a filing date in the caption is not the release date
+    assert date_from_text("Litigation Release No. 25999\nSEC v. X (S.D.N.Y. filed Mar. 1, 2024)") is None
+
+
+def test_date_anomalies_flags_outliers_and_gaps():
+    import pandas as pd
+
+    from insider_screen.sec_releases import date_anomalies
+    days = pd.date_range("2019-01-01", periods=60, freq="D")
+    df = pd.DataFrame({"lr_no": range(1000, 1060), "release_date": [d.date() for d in days]})
+    assert date_anomalies(df).empty
+    df.loc[20, "release_date"] = date(2017, 7, 10)  # complaint filing date read as release date
+    df.loc[40, "release_date"] = None
+    bad = date_anomalies(df)
+    assert dict(zip(bad.lr_no, bad.problem)) == {1020: "out_of_sequence", 1040: "no_date"}
+
+
+def test_fix_dates_updates_from_stored_text(tmp_path):
+    import duckdb
+
+    from insider_screen.sec_releases import fix_dates
+    db = str(tmp_path / "r.duckdb")
+    con = duckdb.connect(db)
+    con.execute("CREATE SCHEMA raw")
+    con.execute("""CREATE TABLE raw.sec_litigation_releases AS SELECT * FROM (VALUES
+        (24498, NULL::DATE, 'Litigation Release No. 24498 / June 11. 2019'),
+        (24713, DATE '2018-07-10', 'Litigation Release No. 24713 / January 13 2020'),
+        (24714, DATE '2020-01-14', 'Litigation Release No. 24714 / January 14, 2020')) t(lr_no, release_date, text)""")
+    con.close()
+    fix_dates(db)
+    con = duckdb.connect(db, read_only=True)
+    got = con.execute("SELECT lr_no, release_date::VARCHAR FROM raw.sec_litigation_releases ORDER BY 1").fetchall()
+    assert got == [(24498, "2019-06-11"), (24713, "2020-01-13"), (24714, "2020-01-14")]

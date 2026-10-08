@@ -5,6 +5,7 @@ including releases from before the 2024 site redesign (e.g. lr-22991 from 2011).
 Numbers are walked sequentially; the start number for a date is found by bisection.
 
 Usage:
+    uv run python -m insider_screen.sec_releases --fix-dates   # re-read dates from stored text, list suspect ones
     uv run python -m insider_screen.sec_releases --since 2016-01-01 --db data/releases.duckdb
 """
 
@@ -24,12 +25,13 @@ from insider_screen.http import PoliteClient
 
 BASE = "https://www.sec.gov/enforcement-litigation/litigation-releases/lr-{n}"
 
+# The date after the slash is written "June 11, 2019", but also "June 11. 2019", "January 13 2020" and "Dec. 18, 2024".
 HEADER_RE = re.compile(
-    r"Litigation Release No\.\s*(\d{4,6})\s*(?:/\s*([A-Z][a-z]+\.?\s+\d{1,2},\s+\d{4}))?"
+    r"Litigation Release No\.\s*(\d{4,6})\s*(?:/\s*([A-Z][a-z]+\.?\s+\d{1,2}[,.]?\s+\d{4}))?"
 )
 DATE_RE = re.compile(
-    r"(January|February|March|April|May|June|July|August|September|October|November|December)"
-    r"\s+\d{1,2},\s+\d{4}"
+    r"(?:January|February|March|April|May|June|July|August|September|October|November|December"
+    r"|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept?|Oct|Nov|Dec)\.?\s+\d{1,2}[,.]?\s+\d{4}"
 )
 INSIDER_RE = re.compile(
     r"insider trading|material,?\s+non-?public|non-?public information"
@@ -61,13 +63,43 @@ class Release:
 
 
 def _parse_date(s: str) -> date | None:
-    s = re.sub(r"\s+", " ", s.replace(".", "")).strip()
-    for fmt in ("%B %d, %Y", "%b %d, %Y"):
+    s = re.sub(r"\s+", " ", re.sub(r"[.,]", " ", s)).strip()
+    s = re.sub(r"^Sept\b", "Sep", s)
+    for fmt in ("%B %d %Y", "%b %d %Y"):
         try:
             return datetime.strptime(s, fmt).date()
         except ValueError:
             pass
     return None
+
+
+def date_from_text(text: str) -> date | None:
+    """Release date from the header: after the slash on the header line, or alone on the next line.
+    Nothing further down is used; the caption below holds filing dates of complaints."""
+    m = HEADER_RE.search(text)
+    if m and m.group(2):
+        return _parse_date(m.group(2))
+    for line in text.split("\n")[:2]:
+        rest = HEADER_RE.sub("", line)
+        dm = DATE_RE.match(rest.strip(" /"))
+        if dm:
+            return _parse_date(dm.group(0))
+    return None
+
+
+def date_anomalies(df: pd.DataFrame, tolerance_days: int = 30, window: int = 11) -> pd.DataFrame:
+    """Releases with no date, or a date far from those of the releases numbered around it. Numbers are
+    issued in date order, so a date more than `tolerance_days` from the median of its `window` nearest
+    neighbours (by number) is suspect. A median isn't thrown off by one bad neighbour."""
+    d = df[["lr_no", "release_date"]].sort_values("lr_no").reset_index(drop=True)
+    days = pd.to_datetime(d.release_date).map(lambda t: t.toordinal() if pd.notna(t) else None).astype("float")
+    median = days.rolling(window, center=True, min_periods=3).median()
+    gap = days - median
+    d["days_from_neighbours"] = gap.round()
+    d["problem"] = None
+    d.loc[days.isna(), "problem"] = "no_date"
+    d.loc[gap.abs() > tolerance_days, "problem"] = "out_of_sequence"
+    return d[d.problem.notna()]
 
 
 def parse_release(html: str | bytes, lr_no: int, url: str = "") -> Release | None:
@@ -87,10 +119,7 @@ def parse_release(html: str | bytes, lr_no: int, url: str = "") -> Release | Non
     if footer:
         text = text[: footer.start()].rstrip()
 
-    release_date = _parse_date(m.group(2)) if m.group(2) else None
-    if release_date is None:
-        dm = DATE_RE.search(text[:300])
-        release_date = _parse_date(dm.group(0)) if dm else None
+    release_date = date_from_text(text)
     if release_date is None:
         t = soup.find("time")
         if t and t.get("datetime"):
@@ -160,6 +189,35 @@ def save(releases: list[Release], db_path: str) -> None:
     con.register("df", df)
     con.execute("CREATE OR REPLACE TABLE raw.sec_litigation_releases AS SELECT * FROM df")
     con.close()
+    report_dates(df)
+
+
+def report_dates(df: pd.DataFrame) -> None:
+    bad = date_anomalies(df)
+    if bad.empty:
+        print("Release dates: none missing or out of sequence")
+        return
+    print(f"Release dates to check ({len(bad)}): missing, or out of sequence with neighbouring release numbers")
+    print(bad.to_string(index=False))
+
+
+def fix_dates(db_path: str) -> None:
+    """Re-read release dates from the stored text with the current header rules (no download), then
+    list what still looks wrong. A date the header doesn't give is left as it was."""
+    con = duckdb.connect(db_path)
+    rows = con.execute("SELECT lr_no, release_date, text FROM raw.sec_litigation_releases").fetchall()
+    changed = []
+    for lr_no, old, text in rows:
+        new = date_from_text(text)
+        if new is not None and new != old:
+            changed.append((lr_no, old, new))
+            con.execute("UPDATE raw.sec_litigation_releases SET release_date = ? WHERE lr_no = ?", [new, lr_no])
+    for lr_no, old, new in changed:
+        print(f"  LR-{lr_no}: {old} -> {new}")
+    print(f"{len(changed)} release dates corrected")
+    df = con.execute("SELECT lr_no, release_date FROM raw.sec_litigation_releases").df()
+    con.close()
+    report_dates(df)
 
 
 def main() -> None:
@@ -168,7 +226,12 @@ def main() -> None:
     ap.add_argument("--start", type=int, help="Skip bisection and start at this release number")
     ap.add_argument("--db", default=RELEASES)
     ap.add_argument("--cache", default="data/cache/sec")
+    ap.add_argument("--fix-dates", action="store_true",
+                    help="Re-read release dates from the stored text and list suspect dates; no download")
     args = ap.parse_args()
+    if args.fix_dates:
+        fix_dates(args.db)
+        return
 
     client = PoliteClient(cache_dir=args.cache)
     start = args.start or find_start(client, date.fromisoformat(args.since))

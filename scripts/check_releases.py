@@ -26,3 +26,7 @@ q("""SELECT lr_no, release_date, left(respondents, 60) AS respondents
      ORDER BY lr_no""")
 
 q("SELECT lr_no, left(respondents, 60) AS respondents FROM raw.sec_litigation_releases WHERE release_date IS NULL")
+# release dates missing or out of sequence with neighbouring release numbers (fix with sec_releases --fix-dates)
+from insider_screen.sec_releases import date_anomalies  # noqa: E402
+
+print(date_anomalies(con.execute("SELECT lr_no, release_date FROM raw.sec_litigation_releases").df()).to_string(index=False))
