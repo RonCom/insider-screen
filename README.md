@@ -6,9 +6,11 @@ Screens material announcements by US-listed companies for abnormal trading befor
 
 ```powershell
 uv sync
-$env:SEC_USER_AGENT = "Chris L cflave@gmail.com"   # SEC requires a name and email
+copy .env.example .env   # then fill in .env: API keys and your SEC User-Agent (name and email)
 uv run pytest
 ```
+
+`.env` is listed in `.gitignore`, so keys in it stay on your machine. The package loads it on import; a variable already set in the shell takes precedence.
 
 ## Labels: SEC litigation releases
 
