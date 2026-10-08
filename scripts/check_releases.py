@@ -24,3 +24,5 @@ q("""SELECT lr_no, release_date, left(respondents, 60) AS respondents
      WHERE is_insider_candidate
        AND NOT regexp_matches(text, '(?i)purchas|bought|sold|traded|trading in')
      ORDER BY lr_no""")
+
+q("SELECT lr_no, left(respondents, 60) AS respondents FROM raw.sec_litigation_releases WHERE release_date IS NULL")

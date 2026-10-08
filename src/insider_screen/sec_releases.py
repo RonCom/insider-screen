@@ -31,7 +31,9 @@ DATE_RE = re.compile(
     r"\s+\d{1,2},\s+\d{4}"
 )
 INSIDER_RE = re.compile(
-    r"insider trading|material,?\s+non-?public|in advance of the .{0,80}announcement",
+    r"insider trading|material,?\s+non-?public|non-?public information"
+    r"|in advance of the .{0,80}announcement|ahead of (?:the|an) .{0,40}announce"
+    r"|\btipp(?:ed|ee|ees|er|ing)\b",
     re.IGNORECASE,
 )
 FLAG_PATTERNS = {

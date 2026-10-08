@@ -49,3 +49,10 @@ def test_non_insider_release():
     ).replace("ahead of the\nJune 5, 2023 announcement", "after the June 5, 2023 offering")
     r = parse_release(page, 25999)
     assert not r.is_insider_candidate
+
+def test_tipping_without_insider_phrases():
+    page = PAGE.replace("SEC Charges Former Analyst with Insider Trading", "SEC Charges Former Analyst").replace(
+        "using material nonpublic information", "after a friend tipped him about the deal"
+    ).replace("ahead of the\nJune 5, 2023 announcement", "before June 5, 2023")
+    assert "insider" not in page.lower() and "nonpublic" not in page.lower()
+    assert parse_release(page, 25999).is_insider_candidate
