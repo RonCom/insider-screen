@@ -64,3 +64,17 @@ uv run python -m insider_screen.shortsale daily --start 2015-01-01 --end 2025-12
 #    Nasdaq TRF months are split into parts; August 2026 was four files of about 1 GB each. Plan for a long run.
 uv run python -m insider_screen.shortsale monthly --start 2015-01 --end 2025-12
 ```
+
+## Stock prices: Alpaca daily bars
+
+```powershell
+# Free Alpaca account (paper trading is enough); keys from the dashboard
+$env:ALPACA_API_KEY_ID = "..."
+$env:ALPACA_API_SECRET_KEY = "..."
+
+# 1. Test run on a few symbols, including delisted ones
+uv run python -m insider_screen.prices --symbols CELG,TWTR,ATVI --db data/test.duckdb
+
+# 2. Every symbol in raw.finra_short_daily plus SPY, raw and adjusted (raw.alpaca_bars_daily); resumable
+uv run python -m insider_screen.prices --start 2016-01-01 --end 2025-12-31
+```
