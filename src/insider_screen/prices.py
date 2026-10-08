@@ -9,8 +9,8 @@ Two copies are loaded: adjustment=raw (actual traded prices, for the $1 and mark
 adjustment=all (split- and dividend-adjusted prices and split-adjusted volume, for returns and
 abnormal volume).
 
-Symbols come from the FINRA daily short-sale table, which lists every NMS stock with off-exchange
-trading on each date, delisted ones included. SPY is always added for the market model.
+Symbols come from the FINRA daily short-sale table (data/finra.duckdb, read-only), which lists every
+NMS stock with off-exchange trading on each date, delisted ones included. SPY is always added for the market model.
 
 Credentials: ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY environment variables.
 
@@ -28,6 +28,8 @@ import time
 import duckdb
 import httpx
 import pandas as pd
+
+from insider_screen.db import FINRA, PRICES
 
 BARS_URL = "https://data.alpaca.markets/v2/stocks/bars"
 MAX_PER_MINUTE = 190  # free plan allows 200
@@ -113,15 +115,24 @@ def fetch_batch(api: Alpaca, symbols: list[str], start: str, end: str, adjustmen
         return pd.concat([a, b], ignore_index=True), ea + eb
 
 
-def finra_symbols(con: duckdb.DuckDBPyConnection) -> list[str]:
+def finra_symbols(finra_db: str) -> list[str]:
     try:
-        syms = [r[0] for r in con.execute("SELECT DISTINCT symbol FROM raw.finra_short_daily").fetchall()]
+        con = duckdb.connect(finra_db, read_only=True)
+    except duckdb.IOException as err:
+        raise SystemExit(f"Can't open {finra_db} ({err}). It's missing, or a FINRA load has it open; "
+                         "wait for that load, or pass --symbols") from err
+    try:
+        return [r[0] for r in con.execute("SELECT DISTINCT symbol FROM raw.finra_short_daily").fetchall()]
     except duckdb.CatalogException as err:
-        raise SystemExit("raw.finra_short_daily not found; run `insider_screen.shortsale daily` first") from err
-    return syms
+        raise SystemExit(f"raw.finra_short_daily not in {finra_db}; run `insider_screen.shortsale daily` first") from err
+    finally:
+        con.close()
 
 
-def load(api: Alpaca, db: str, start: str, end: str, symbols: list[str] | None = None) -> None:
+def load(api: Alpaca, db: str, start: str, end: str, symbols: list[str] | None = None,
+         finra_db: str = FINRA) -> None:
+    if symbols is None:
+        symbols = finra_symbols(finra_db)
     con = duckdb.connect(db)
     con.execute("CREATE SCHEMA IF NOT EXISTS raw")
     con.execute(
@@ -131,8 +142,6 @@ def load(api: Alpaca, db: str, start: str, end: str, symbols: list[str] | None =
     con.execute(
         """CREATE TABLE IF NOT EXISTS raw.alpaca_symbols_done (
              symbol VARCHAR, adjustment VARCHAR, n_bars BIGINT, error VARCHAR)""")
-    if symbols is None:
-        symbols = finra_symbols(con)
     symbols = sorted({s.strip().upper().replace("/", ".").replace(" ", ".") for s in symbols} | {MARKET})
     skipped = [s for s in symbols if not VALID_SYMBOL.match(s)]
     symbols = [s for s in symbols if VALID_SYMBOL.match(s)]
@@ -169,7 +178,8 @@ def load(api: Alpaca, db: str, start: str, end: str, symbols: list[str] | None =
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db", default="data/insider.duckdb")
+    ap.add_argument("--db", default=PRICES)
+    ap.add_argument("--finra-db", default=FINRA)
     ap.add_argument("--start", default="2016-01-01")
     ap.add_argument("--end", default="2025-12-31")
     ap.add_argument("--symbols", help="Comma-separated symbols instead of the FINRA list (for a test run)")
@@ -178,7 +188,7 @@ def main() -> None:
     if not key or not secret:
         raise SystemExit("Set ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY")
     syms = a.symbols.split(",") if a.symbols else None
-    load(Alpaca(key, secret), a.db, a.start, a.end, syms)
+    load(Alpaca(key, secret), a.db, a.start, a.end, syms, a.finra_db)
 
 
 if __name__ == "__main__":

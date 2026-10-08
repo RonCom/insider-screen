@@ -1,6 +1,6 @@
 import duckdb
 
-con = duckdb.connect("data/insider.duckdb", read_only=True)
+con = duckdb.connect("data/releases.duckdb", read_only=True)
 q = lambda sql: print(con.execute(sql).df().to_string(index=False), "\n")
 
 # candidates per year, and how many mention options or credit FINRA / the detection center

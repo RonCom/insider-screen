@@ -5,7 +5,7 @@ including releases from before the 2024 site redesign (e.g. lr-22991 from 2011).
 Numbers are walked sequentially; the start number for a date is found by bisection.
 
 Usage:
-    uv run python -m insider_screen.sec_releases --since 2016-01-01 --db data/insider.duckdb
+    uv run python -m insider_screen.sec_releases --since 2016-01-01 --db data/releases.duckdb
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ import duckdb
 import pandas as pd
 from bs4 import BeautifulSoup
 
+from insider_screen.db import RELEASES
 from insider_screen.http import PoliteClient
 
 BASE = "https://www.sec.gov/enforcement-litigation/litigation-releases/lr-{n}"
@@ -165,7 +166,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--since", default="2016-01-01")
     ap.add_argument("--start", type=int, help="Skip bisection and start at this release number")
-    ap.add_argument("--db", default="data/insider.duckdb")
+    ap.add_argument("--db", default=RELEASES)
     ap.add_argument("--cache", default="data/cache/sec")
     args = ap.parse_args()
 

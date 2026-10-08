@@ -33,6 +33,7 @@ import exchange_calendars as xc
 import httpx
 import pandas as pd
 
+from insider_screen.db import FINRA
 from insider_screen.http import DEFAULT_USER_AGENT, PoliteClient
 
 DAILY_URL = "https://cdn.finra.org/equity/regsho/daily/{fac}shvol{d:%Y%m%d}.txt"
@@ -295,11 +296,11 @@ def main() -> None:
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("probe")
     d = sub.add_parser("daily")
-    d.add_argument("--db", default="data/insider.duckdb")
+    d.add_argument("--db", default=FINRA)
     d.add_argument("--start", default="2015-01-01")
     d.add_argument("--end", default="2025-12-31")
     mo = sub.add_parser("monthly")
-    mo.add_argument("--db", default="data/insider.duckdb")
+    mo.add_argument("--db", default=FINRA)
     mo.add_argument("--start", default="2015-01")
     mo.add_argument("--end", default="2025-12")
     mo.add_argument("--keep-zips", action="store_true")

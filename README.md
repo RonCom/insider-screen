@@ -12,6 +12,23 @@ uv run pytest
 
 `.env` is listed in `.gitignore`, so keys in it stay on your machine. The package loads it on import; a variable already set in the shell takes precedence.
 
+## Database files
+
+Each loader writes its own DuckDB file, so long runs (an extraction and a price load, say) can go at the same time. DuckDB lets one process write a file at a time.
+
+| File | Written by |
+| --- | --- |
+| `data/releases.duckdb` | `sec_releases`, `extract`, `match` |
+| `data/edgar.duckdb` | `edgar` |
+| `data/finra.duckdb` | `shortsale daily`, `shortsale monthly` |
+| `data/prices.duckdb` | `prices` |
+
+`match` reads `edgar.duckdb` and `prices` reads `finra.duckdb`, both read-only; each fails while the other file's loader is running. Data from before this split, in `data/insider.duckdb`, moves over with:
+
+```powershell
+uv run python -m insider_screen.db split
+```
+
 ## Labels: SEC litigation releases
 
 ```powershell
@@ -27,7 +44,7 @@ uv run python -m insider_screen.extract sample
 uv run python -m insider_screen.extract score
 ```
 
-Tables land in `data/insider.duckdb`: `raw.sec_litigation_releases`, `extracted.release_extractions`, and the view `extracted.traded_events`.
+Tables land in `data/releases.duckdb`: `raw.sec_litigation_releases`, `extracted.release_extractions`, and the view `extracted.traded_events`.
 
 ## Events: EDGAR 8-K filings
 
@@ -51,7 +68,7 @@ uv run python -m insider_screen.edgar events
 uv run python -m insider_screen.match --model gemma4:26b
 ```
 
-Writes `labels.release_event_matches` (one row per extracted event, with a reason when unmatched) and the view `labels.charged_events`.
+Writes `labels.release_event_matches` (one row per extracted event, with a reason when unmatched) and `labels.charged_events` (every event with an `is_charged` flag). Reads events from `data/edgar.duckdb`.
 
 ## Off-exchange short sales: FINRA Reg SHO files
 
@@ -65,4 +82,16 @@ uv run python -m insider_screen.shortsale daily --start 2015-01-01 --end 2025-12
 # 3. Trade-level files aggregated to daily counts (raw.finra_short_trades_daily); streamed, aggregated and deleted.
 #    Nasdaq TRF months are split into parts; August 2026 was four files of about 1 GB each. Plan for a long run.
 uv run python -m insider_screen.shortsale monthly --start 2015-01 --end 2025-12
+```
+
+## Stock prices: Alpaca daily bars
+
+```powershell
+# Free Alpaca account (paper trading is enough); put its keys in .env as ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY
+
+# 1. Test run on a few symbols, including delisted ones
+uv run python -m insider_screen.prices --symbols CELG,TWTR,ATVI --db data/test.duckdb
+
+# 2. Every symbol in raw.finra_short_daily plus SPY, raw and adjusted (raw.alpaca_bars_daily in data/prices.duckdb); resumable
+uv run python -m insider_screen.prices --start 2016-01-01 --end 2025-12-31
 ```

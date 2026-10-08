@@ -35,6 +35,7 @@ import duckdb
 import exchange_calendars as xc
 import pandas as pd
 
+from insider_screen.db import EDGAR
 from insider_screen.http import DEFAULT_USER_AGENT
 
 BULK_URL = "https://www.sec.gov/Archives/edgar/daily-index/bulkdata/submissions.zip"
@@ -231,11 +232,11 @@ def main() -> None:
     d.add_argument("--dest", default="data/edgar/submissions.zip")
     ld = sub.add_parser("load")
     ld.add_argument("--zip", default="data/edgar/submissions.zip")
-    ld.add_argument("--db", default="data/insider.duckdb")
+    ld.add_argument("--db", default=EDGAR)
     t = sub.add_parser("check-tz")
-    t.add_argument("--db", default="data/insider.duckdb")
+    t.add_argument("--db", default=EDGAR)
     e = sub.add_parser("events")
-    e.add_argument("--db", default="data/insider.duckdb")
+    e.add_argument("--db", default=EDGAR)
     e.add_argument("--start", default="2016-01-01")
     e.add_argument("--end", default="2025-12-31")
     a = ap.parse_args()

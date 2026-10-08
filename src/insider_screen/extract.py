@@ -29,6 +29,8 @@ import httpx
 import pandas as pd
 from pydantic import BaseModel, Field, ValidationError
 
+from insider_screen.db import RELEASES
+
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "gemma4:26b")
 PROMPT_VERSION = "v2"
@@ -300,11 +302,11 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run")
-    r.add_argument("--db", default="data/insider.duckdb")
+    r.add_argument("--db", default=RELEASES)
     r.add_argument("--model", default=DEFAULT_MODEL)
     r.add_argument("--limit", type=int)
     s = sub.add_parser("sample")
-    s.add_argument("--db", default="data/insider.duckdb")
+    s.add_argument("--db", default=RELEASES)
     s.add_argument("--model", default=DEFAULT_MODEL)
     s.add_argument("--out", default="data/handcheck.csv")
     c = sub.add_parser("score")

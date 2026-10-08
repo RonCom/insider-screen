@@ -7,19 +7,21 @@
 Unmatched releases are kept with a reason so the miss rate can be reported.
 
 Usage:
-    uv run python -m insider_screen.match --db data/insider.duckdb --model qwen2.5:14b
+    uv run python -m insider_screen.match --db data/releases.duckdb --edgar-db data/edgar.duckdb --model qwen2.5:14b
 """
 
 from __future__ import annotations
 
 import argparse
 import re
+from pathlib import Path
 
 import duckdb
 import exchange_calendars as xc
 import pandas as pd
 from rapidfuzz import fuzz, process
 
+from insider_screen.db import EDGAR, RELEASES
 from insider_screen.extract import model_key
 
 MIN_SCORE = 92
@@ -110,24 +112,25 @@ def match(traded: pd.DataFrame, companies: pd.DataFrame, events: pd.DataFrame,
     return pd.DataFrame(rows)
 
 
-def run(db: str, model: str) -> pd.DataFrame:
+def run(db: str, model: str, edgar_db: str = EDGAR) -> pd.DataFrame:
     con = duckdb.connect(db)
+    con.execute(f"ATTACH '{Path(edgar_db).as_posix()}' AS edgar (READ_ONLY)")
     traded = con.execute(
         """SELECT DISTINCT lr_no, issuer_name, announcement_date, event_type FROM extracted.traded_events_v2
            WHERE model = ? AND is_insider_trading_case""",
         [model_key(model)],
     ).df()
-    companies = con.execute("SELECT cik, name, former_names FROM raw.edgar_companies").df()
-    events = con.execute("SELECT event_id, cik, event_type, day0 FROM events.announcements").df()
+    companies = con.execute("SELECT cik, name, former_names FROM edgar.raw.edgar_companies").df()
+    events = con.execute("SELECT event_id, cik, event_type, day0 FROM edgar.events.announcements").df()
     cal = xc.get_calendar("XNYS", start="2005-01-01")
     out = match(traded, companies, events, cal)
     con.execute("CREATE SCHEMA IF NOT EXISTS labels")
     con.register("out", out)
     con.execute("CREATE OR REPLACE TABLE labels.release_event_matches AS SELECT * FROM out")
     con.execute(
-        """CREATE OR REPLACE VIEW labels.charged_events AS
+        """CREATE OR REPLACE TABLE labels.charged_events AS
            SELECT a.*, m.event_id IS NOT NULL AS is_charged, m.lr_numbers
-           FROM events.announcements a
+           FROM edgar.events.announcements a
            LEFT JOIN (SELECT event_id, string_agg(DISTINCT CAST(lr_no AS VARCHAR), '|') AS lr_numbers
                       FROM labels.release_event_matches WHERE event_id IS NOT NULL GROUP BY 1) m
            USING (event_id)"""
@@ -140,10 +143,11 @@ def run(db: str, model: str) -> pd.DataFrame:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db", default="data/insider.duckdb")
+    ap.add_argument("--db", default=RELEASES)
+    ap.add_argument("--edgar-db", default=EDGAR)
     ap.add_argument("--model", default="gemma4:26b")
     a = ap.parse_args()
-    run(a.db, a.model)
+    run(a.db, a.model, a.edgar_db)
 
 
 if __name__ == "__main__":
