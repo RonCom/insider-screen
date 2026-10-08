@@ -26,7 +26,3 @@ packages = ["src/insider_screen"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
-
-[project.scripts]
-dao = "finra_nlp.dao:main"
-monthly = "finra_nlp.monthly:main"
