@@ -78,4 +78,30 @@ def test_run_writes_clean_rows(tmp_path, monkeypatch):
     extract.run(db, "m", None)  # second run skips done releases
     con = duckdb.connect(db)
     rows = con.execute("SELECT model, issuer_name, announcement_date::VARCHAR, date_check FROM extracted.traded_events").fetchall()
-    assert rows == [("m#v2", "Target Co.", "2023-06-05", "verified")]
+    assert rows == [("m#v3", "Target Co.", "2023-06-05", "verified")]
+
+
+def test_trade_date_verified_and_latest_kept():
+    text = TEXT + " Doe last bought Target Co. stock on June 2, 2023, three days before the news."
+    rows = clean_events(ext([
+        ev(last_trade_date="2023-06-02", trade_evidence="Doe last bought Target Co. stock on June 2, 2023"),
+        ev(last_trade_date="2023-05-01", trade_evidence="bought on May 1, 2023"),  # quote not in release
+    ]), text)
+    assert (rows[0]["last_trade_date"], rows[0]["trade_check"]) == (date(2023, 6, 2), "verified")
+
+
+def test_failed_release_is_retried(tmp_path, monkeypatch):
+    db = str(tmp_path / "t.duckdb")
+    con = duckdb.connect(db)
+    con.execute("CREATE SCHEMA raw")
+    con.execute("CREATE TABLE raw.sec_litigation_releases AS SELECT 1 AS lr_no, ? AS text, TRUE AS is_insider_candidate, 'u' AS url", [TEXT])
+    con.close()
+
+    def boom(text, model, client):
+        raise httpx.ReadTimeout("timed out")
+    monkeypatch.setattr(extract, "call_ollama", boom)
+    extract.run(db, "m", None)
+    monkeypatch.setattr(extract, "call_ollama", lambda text, model, client: ext([ev()]))
+    extract.run(db, "m", None)
+    con = duckdb.connect(db)
+    assert con.execute("SELECT ok FROM extracted.release_extractions").fetchall() == [(True,)]

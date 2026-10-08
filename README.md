@@ -35,16 +35,18 @@ uv run python -m insider_screen.db split
 # 1. Download and parse releases from 2016 on (roughly 3,000-4,000 pages at 5 requests/second: 10-15 minutes the first run, cached after)
 uv run python -m insider_screen.sec_releases --since 2016-01-01
 
-# 2. Extract traded events from insider-trading candidates with a local model (Ollama running)
-uv run python -m insider_screen.extract run --model gemma4:26b --limit 20   # check a few first
-uv run python -m insider_screen.extract run --model gemma4:26b
+# 2. Extract traded events from insider-trading candidates with a local model (Ollama running).
+#    On an 8 GB GPU: set OLLAMA_FLASH_ATTENTION=1 and OLLAMA_KV_CACHE_TYPE=q8_0 for Ollama itself (setx, then
+#    restart Ollama), and OLLAMA_NUM_CTX=5120 and OLLAMA_THINK=false in .env for qwen3:8b.
+uv run python -m insider_screen.extract run --model qwen3:8b --limit 20   # check a few first
+uv run python -m insider_screen.extract run --model qwen3:8b
 
 # 3. Hand-check 100 releases: fill the ok_* columns with Y or N, then score (gate: 0.90 on issuer and date)
 uv run python -m insider_screen.extract sample
 uv run python -m insider_screen.extract score
 ```
 
-Tables land in `data/releases.duckdb`: `raw.sec_litigation_releases`, `extracted.release_extractions`, and the view `extracted.traded_events`.
+Tables land in `data/releases.duckdb`: `raw.sec_litigation_releases`, `extracted.release_extractions`, `extracted.traded_events_v3`, and the view `extracted.traded_events` over it.
 
 ## Events: EDGAR 8-K filings
 
@@ -65,7 +67,7 @@ uv run python -m insider_screen.edgar events
 ## Labels matched to events
 
 ```powershell
-uv run python -m insider_screen.match --model gemma4:26b
+uv run python -m insider_screen.match --model qwen3:8b
 ```
 
 Writes `labels.release_event_matches` (one row per extracted event, with a reason when unmatched) and `labels.charged_events` (every event with an `is_charged` flag). Reads events from `data/edgar.duckdb`.

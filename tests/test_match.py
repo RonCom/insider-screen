@@ -25,8 +25,9 @@ EVENTS = pd.DataFrame({
 })
 
 
-def traded(name, ann, etype="acquisition_target"):
+def traded(name, ann, etype="acquisition_target", last_trade=None):
     return pd.DataFrame({"lr_no": [1], "issuer_name": [name], "announcement_date": [pd.Timestamp(ann) if ann else pd.NaT],
+                         "last_trade_date": [pd.Timestamp(last_trade) if last_trade else pd.NaT],
                          "event_type": [etype]})
 
 
@@ -42,7 +43,7 @@ def test_fuzzy_name_and_gap():
 
 def test_reasons():
     assert match(traded("Zzyzx Widgets", "2021-06-16"), COMPANIES, EVENTS, CAL).iloc[0].reason == "no_company"
-    assert match(traded("Kindred Biosciences", None), COMPANIES, EVENTS, CAL).iloc[0].reason == "no_announcement_date"
+    assert match(traded("Kindred Biosciences", None), COMPANIES, EVENTS, CAL).iloc[0].reason == "no_dates"
     assert match(traded("Kindred Biosciences", "2021-03-01"), COMPANIES, EVENTS, CAL).iloc[0].reason == "no_event_in_window"
 
 
@@ -50,7 +51,7 @@ def test_run_reads_events_from_edgar_file(tmp_path):
     import duckdb
 
     from insider_screen import match as m
-    from insider_screen.extract import model_key
+    from insider_screen.extract import TABLE, model_key
 
     rel, edg = str(tmp_path / "releases.duckdb"), str(tmp_path / "edgar.duckdb")
     con = duckdb.connect(edg)
@@ -63,11 +64,18 @@ def test_run_reads_events_from_edgar_file(tmp_path):
     con = duckdb.connect(rel)
     con.execute("CREATE SCHEMA extracted")
     con.execute(
-        """CREATE TABLE extracted.traded_events_v2 AS SELECT 1 AS lr_no, 'Kindred Biosciences' AS issuer_name,
-           DATE '2021-06-16' AS announcement_date, 'acquisition_target' AS event_type, TRUE AS is_insider_trading_case,
-           ? AS model""", [model_key("m")])
+        f"""CREATE TABLE {TABLE} AS SELECT 1 AS lr_no, 'Kindred Biosciences' AS issuer_name,
+           DATE '2021-06-16' AS announcement_date, NULL::DATE AS last_trade_date, 'acquisition_target' AS event_type,
+           TRUE AS is_insider_trading_case, ? AS model""", [model_key("m")])
     con.close()
     m.run(rel, "m", edg)
     con = duckdb.connect(rel, read_only=True)
     assert con.execute("SELECT event_id FROM labels.release_event_matches").fetchone() == ("acq-1",)
     assert con.execute("SELECT count(*), sum(is_charged::INT) FROM labels.charged_events").fetchone() == (3, 1)
+
+
+def test_trade_date_fallback():
+    out = match(traded("Kindred Biosciences", None, last_trade="2021-06-10"), COMPANIES, EVENTS, CAL).iloc[0]
+    assert (out.event_id, out.date_source) == ("acq-1", "last_trade_date")  # acquisition preferred over earnings day after
+    out = match(traded("Kindred Biosciences", None, last_trade="2021-04-01"), COMPANIES, EVENTS, CAL).iloc[0]
+    assert out.reason == "no_event_after_trades"  # 76 days before the event: outside the 30-day window

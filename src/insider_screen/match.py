@@ -4,10 +4,12 @@
    best fuzzy match (rapidfuzz token_set_ratio) at or above MIN_SCORE among filers with events.
 2. CIK + announcement date -> event: the event for that CIK whose day 0 is within +-3 trading
    sessions of the announcement date, preferring the same event type, then the smallest gap.
+3. No verified announcement date but a verified last trade date: the first event for that CIK with
+   day 0 after the last trade and within TRADE_WINDOW_DAYS calendar days, preferring the same type.
 Unmatched releases are kept with a reason so the miss rate can be reported.
 
 Usage:
-    uv run python -m insider_screen.match --db data/releases.duckdb --edgar-db data/edgar.duckdb --model qwen2.5:14b
+    uv run python -m insider_screen.match --db data/releases.duckdb --edgar-db data/edgar.duckdb --model qwen3:8b
 """
 
 from __future__ import annotations
@@ -22,10 +24,11 @@ import pandas as pd
 from rapidfuzz import fuzz, process
 
 from insider_screen.db import EDGAR, RELEASES
-from insider_screen.extract import model_key
+from insider_screen.extract import DEFAULT_MODEL, TABLE, model_key
 
 MIN_SCORE = 92
 MAX_SESSIONS = 3
+TRADE_WINDOW_DAYS = 30
 SUFFIXES = {
     "inc", "incorporated", "corp", "corporation", "co", "company", "ltd", "limited", "plc", "holdings",
     "holding", "group", "lp", "llc", "sa", "nv", "ag", "the", "de", "class", "a", "b",
@@ -86,29 +89,41 @@ def match(traded: pd.DataFrame, companies: pd.DataFrame, events: pd.DataFrame,
         cik, method, score = resolve_cik(t.issuer_name, lookup, keys)
         base = {"lr_no": t.lr_no, "issuer_name": t.issuer_name, "announcement_date": t.announcement_date,
                 "release_event_type": t.event_type, "cik": cik, "name_method": method, "name_score": score,
-                "event_id": None, "event_type": None, "session_gap": None, "reason": None}
+                "event_id": None, "event_type": None, "session_gap": None, "date_source": None, "reason": None}
         if cik is None:
             rows.append({**base, "reason": method})
             continue
-        if pd.isna(t.announcement_date):
-            rows.append({**base, "reason": "no_announcement_date"})
-            continue
-        ai = session_index(pd.Timestamp(t.announcement_date))
         cands = ev_by_cik.get(cik)
         if cands is None:
             rows.append({**base, "reason": "no_event_for_cik"})
             continue
+        want = TYPE_MAP.get(t.event_type)
+        if pd.isna(t.announcement_date):
+            last = getattr(t, "last_trade_date", None)
+            if last is None or pd.isna(last):
+                rows.append({**base, "reason": "no_dates"})
+                continue
+            last = pd.Timestamp(last)
+            after = cands[(cands.day0 > last) & (cands.day0 <= last + pd.Timedelta(days=TRADE_WINDOW_DAYS))]
+            if after.empty:
+                rows.append({**base, "reason": "no_event_after_trades"})
+                continue
+            after = after.assign(type_ok=(after.event_type == want) if want else False)
+            best = after.sort_values(["type_ok", "day0"], ascending=[False, True]).iloc[0]
+            rows.append({**base, "event_id": best.event_id, "event_type": best.event_type,
+                         "session_gap": None, "date_source": "last_trade_date"})
+            continue
+        ai = session_index(pd.Timestamp(t.announcement_date))
         cands = cands.assign(gap=[pos[pd.Timestamp(d)] - ai for d in cands.day0])
         cands = cands[cands.gap.abs() <= MAX_SESSIONS]
         if cands.empty:
             rows.append({**base, "reason": "no_event_in_window"})
             continue
-        want = TYPE_MAP.get(t.event_type)
         cands = cands.assign(type_ok=(cands.event_type == want) if want else False,
                              absgap=cands.gap.abs())
         best = cands.sort_values(["type_ok", "absgap"], ascending=[False, True]).iloc[0]
         rows.append({**base, "event_id": best.event_id, "event_type": best.event_type,
-                     "session_gap": int(best.gap)})
+                     "session_gap": int(best.gap), "date_source": "announcement_date"})
     return pd.DataFrame(rows)
 
 
@@ -116,7 +131,7 @@ def run(db: str, model: str, edgar_db: str = EDGAR) -> pd.DataFrame:
     con = duckdb.connect(db)
     con.execute(f"ATTACH '{Path(edgar_db).as_posix()}' AS edgar (READ_ONLY)")
     traded = con.execute(
-        """SELECT DISTINCT lr_no, issuer_name, announcement_date, event_type FROM extracted.traded_events_v2
+        f"""SELECT DISTINCT lr_no, issuer_name, announcement_date, last_trade_date, event_type FROM {TABLE}
            WHERE model = ? AND is_insider_trading_case""",
         [model_key(model)],
     ).df()
@@ -145,7 +160,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default=RELEASES)
     ap.add_argument("--edgar-db", default=EDGAR)
-    ap.add_argument("--model", default="gemma4:26b")
+    ap.add_argument("--model", default=DEFAULT_MODEL)
     a = ap.parse_args()
     run(a.db, a.model, a.edgar_db)
 
