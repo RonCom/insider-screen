@@ -105,3 +105,18 @@ def test_failed_release_is_retried(tmp_path, monkeypatch):
     extract.run(db, "m", None)
     con = duckdb.connect(db)
     assert con.execute("SELECT ok FROM extracted.release_extractions").fetchall() == [(True,)]
+
+
+def test_run_works_on_table_without_primary_key(tmp_path, monkeypatch):
+    """`db split` copies release_extractions with CREATE TABLE AS, which drops the primary key."""
+    db = str(tmp_path / "t.duckdb")
+    con = duckdb.connect(db)
+    con.execute("CREATE SCHEMA raw; CREATE SCHEMA extracted")
+    con.execute("CREATE TABLE raw.sec_litigation_releases AS SELECT 1 AS lr_no, ? AS text, TRUE AS is_insider_candidate, 'u' AS url", [TEXT])
+    con.execute("""CREATE TABLE extracted.release_extractions AS
+                   SELECT 1 AS lr_no, 'm#v3' AS model, FALSE AS ok, 'timed out' AS error, NULL::JSON AS payload""")
+    con.close()
+    monkeypatch.setattr(extract, "call_ollama", lambda text, model, client: ext([ev()]))
+    extract.run(db, "m", None)
+    con = duckdb.connect(db)
+    assert con.execute("SELECT lr_no, ok FROM extracted.release_extractions").fetchall() == [(1, True)]

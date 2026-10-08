@@ -226,6 +226,13 @@ def clean_events(ext: ReleaseExtraction, text: str) -> list[dict]:
     return out
 
 
+def _record(con, row: tuple) -> None:
+    """Replace the row for (lr_no, model). Delete-then-insert works whether or not the table kept its
+    primary key; `db split` copies tables with CREATE TABLE AS, which drops constraints."""
+    con.execute("DELETE FROM extracted.release_extractions WHERE lr_no = ? AND model = ?", [row[0], row[1]])
+    con.execute("INSERT INTO extracted.release_extractions VALUES (?, ?, ?, ?, ?)", row)
+
+
 def run(db: str, model: str, limit: int | None) -> None:
     key = model_key(model)
     con = duckdb.connect(db)
@@ -257,11 +264,9 @@ def run(db: str, model: str, limit: int | None) -> None:
             try:
                 ext = call_ollama(text, model, client)
             except (ValidationError, httpx.HTTPError, KeyError) as err:
-                con.execute("INSERT OR REPLACE INTO extracted.release_extractions VALUES (?, ?, ?, ?, ?)",
-                            (lr_no, key, False, str(err)[:500], None))
+                _record(con, (lr_no, key, False, str(err)[:500], None))
                 continue
-            con.execute("INSERT OR REPLACE INTO extracted.release_extractions VALUES (?, ?, ?, ?, ?)",
-                        (lr_no, key, True, None, ext.model_dump_json()))
+            _record(con, (lr_no, key, True, None, ext.model_dump_json()))
             con.execute(f"DELETE FROM {TABLE} WHERE lr_no = ? AND model = ?", [lr_no, key])
             for ev in clean_events(ext, text):
                 con.execute(
