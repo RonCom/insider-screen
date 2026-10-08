@@ -50,6 +50,7 @@ def test_non_insider_release():
     r = parse_release(page, 25999)
     assert not r.is_insider_candidate
 
+
 def test_tipping_without_insider_phrases():
     page = PAGE.replace("SEC Charges Former Analyst with Insider Trading", "SEC Charges Former Analyst").replace(
         "using material nonpublic information", "after a friend tipped him about the deal"

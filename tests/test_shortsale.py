@@ -103,3 +103,14 @@ Q|BBB|20160302|10:00:00|E|50|5.0|A
     assert a[["symbol", "short_trades", "short_shares", "small_trades"]].values.tolist() == \
         b[["symbol", "short_trades", "short_shares", "small_trades"]].values.tolist()
     assert not (tmp_path / "FNSQsh201603_1.txt").exists()
+
+
+def test_bad_file_is_skipped_not_fatal():
+    class Bad(FakeClient):
+        def get(self, url, use_cache=True, store=True):
+            if "FNYXshvol20160301" in url:
+                return 200, b"<?xml version='1.0'?><Error>Something</Error>"
+            return super().get(url, use_cache, store)
+    df, got = ss.fetch_day(Bad(), date(2016, 3, 1))
+    assert got == ["FNSQ"] and len(df) == 1
+    assert ss.BAD_FILES and "FNYXshvol20160301" in ss.BAD_FILES[-1][0]

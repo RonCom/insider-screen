@@ -59,6 +59,9 @@ def parse_daily(text: str) -> pd.DataFrame:
     rename = {"date": "date", "symbol": "symbol", "shortvolume": "short_volume",
               "shortexemptvolume": "short_exempt_volume", "totalvolume": "total_volume"}
     df = df.rename(columns=rename)
+    missing = {"date", "symbol", "short_volume", "total_volume"} - set(df.columns)
+    if missing:
+        raise ValueError(f"missing columns {sorted(missing)}; first line: {lines[0][:200]!r}")
     if "short_exempt_volume" not in df:
         df["short_exempt_volume"] = 0
     df = df[["date", "symbol", "short_volume", "short_exempt_volume", "total_volume"]]
@@ -68,13 +71,21 @@ def parse_daily(text: str) -> pd.DataFrame:
     return df.dropna(subset=["date", "total_volume"])
 
 
+BAD_FILES: list[tuple[str, str]] = []
+
+
 def fetch_day(client: PoliteClient, d: date) -> tuple[pd.DataFrame, list[str]]:
     frames, got = [], []
     for fac in facilities_for(d):
-        status, body = client.get(DAILY_URL.format(fac=fac, d=d), store=False)
+        url = DAILY_URL.format(fac=fac, d=d)
+        status, body = client.get(url, store=False)
         if status == 200 and body:
-            frames.append(parse_daily(body.decode("latin-1")))
-            got.append(fac)
+            try:
+                frames.append(parse_daily(body.decode("latin-1")))
+                got.append(fac)
+            except ValueError as err:
+                BAD_FILES.append((url, str(err)))
+                print(f"  skipped {url}: {err}")
     if not frames:
         return pd.DataFrame(), got
     df = pd.concat(frames)
@@ -111,6 +122,9 @@ def load_daily(client: PoliteClient, db: str, start: str, end: str) -> None:
     con.close()
     if missing:
         print(f"{len(missing)} sessions with no file, first few: {missing[:10]}")
+    if BAD_FILES:
+        print(f"{len(BAD_FILES)} files skipped for an unexpected layout; a day with one bad facility file "
+              "is loaded from the others and listed here")
 
 
 def find_parts(head, fac: str, y: int, m: int) -> list[str]:
