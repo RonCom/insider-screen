@@ -4,7 +4,8 @@ Daily Short Sale Volume Files (one per reporting facility per trade date, named
 <FACILITY>shvol<YYYYMMDD>.txt). Layout since 2011-02-28, per FINRA's file layout guide:
 Date|Symbol|ShortVolume|ShortExemptVolume|TotalVolume|Market, with a header row and a trailer row.
 - From 2018-08-01: CNMS (consolidated TRF + ADF file for NMS stocks).
-- Before that: FNSQ (Nasdaq TRF), FNYX (NYSE TRF), FNQC (Nasdaq TRF Chicago) summed by symbol.
+- Before that: FNSQ (Nasdaq TRF) and FNYX (NYSE TRF) summed by symbol. FNQC (Nasdaq TRF Chicago)
+  starts 2018-09-10, after the consolidated file, so it's never needed.
 
 Monthly Short Sale Transaction Files (trade-level) at regsho.finra.org/<FACILITY>sh<YYYYMM>.txt.zip.
 FINRA's TRF pages list them only through 2021, so the trade-size features cover the
@@ -35,7 +36,7 @@ from insider_screen.http import DEFAULT_USER_AGENT, PoliteClient
 DAILY_URL = "https://cdn.finra.org/equity/regsho/daily/{fac}shvol{d:%Y%m%d}.txt"
 MONTHLY_URL = "http://regsho.finra.org/{fac}sh{y}{m:02d}.txt.zip"
 CNMS_START = date(2018, 8, 1)
-PRE_CNMS = ["FNSQ", "FNYX", "FNQC"]
+PRE_CNMS = ["FNSQ", "FNYX"]
 MONTHLY_FACILITIES = ["FNSQ", "FNYX", "FNQC"]
 
 

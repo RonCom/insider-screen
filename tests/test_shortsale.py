@@ -40,7 +40,7 @@ def test_parse_daily_drops_trailer():
 
 
 def test_facilities_switch():
-    assert ss.facilities_for(date(2018, 7, 31)) == ["FNSQ", "FNYX", "FNQC"]
+    assert ss.facilities_for(date(2018, 7, 31)) == ["FNSQ", "FNYX"]
     assert ss.facilities_for(date(2018, 8, 1)) == ["CNMS"]
 
 
