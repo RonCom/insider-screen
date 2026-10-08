@@ -17,6 +17,7 @@ Usage:
 Settings (shell or .env): OLLAMA_MODEL, OLLAMA_NUM_CTX (default 8192; 5120 fits qwen3:8b on an 8 GB GPU),
 OLLAMA_THINK (false turns off qwen3's reasoning; leave unset for models without it).
     uv run python -m insider_screen.extract score --csv data/handcheck.csv
+    uv run python -m insider_screen.extract reclean --model gemma4:e4b   # re-apply checks to stored output
 """
 
 from __future__ import annotations
@@ -178,6 +179,16 @@ DESCRIPTOR_RE = re.compile(
 UNNAMED_RE = re.compile(r"^(?:a|an|the|at least|several|various|certain|unnamed|unknown|null|none)\b", re.I)
 
 
+ALIAS_RE = re.compile(r"""\s*\(\s*(?:the\s+)?["\u201c\u2018'][^()]{1,60}["\u201d\u2019']\s*\)""", re.I)
+
+
+def clean_issuer(issuer: str | None) -> str | None:
+    """Drop a defined-term alias: 'Potash Corporation of Saskatchewan ("Potash")' -> the name alone."""
+    if issuer is None:
+        return None
+    return re.sub(r"\s+", " ", ALIAS_RE.sub("", issuer)).strip()
+
+
 def is_named(issuer: str | None) -> bool:
     if not issuer or issuer.strip().lower() in {"null", "none", "n/a"}:
         return False
@@ -200,6 +211,7 @@ def _combine(values: list[str], both: str = "both") -> str:
 def clean_events(ext: ReleaseExtraction, text: str) -> list[dict]:
     rows: dict[str, dict] = {}
     for ev in ext.events:
+        ev = ev.model_copy(update={"issuer_name": clean_issuer(ev.issuer_name)})
         if not is_named(ev.issuer_name):
             continue
         d, why = check_date(ev, text)
@@ -304,6 +316,31 @@ def run(db: str, model: str, limit: int | None) -> None:
     print(f"{failed} releases failed extraction; {no_events} returned no named events")
 
 
+def reclean(db: str, model: str) -> None:
+    """Rebuild the events table for one model from the stored model output, without calling the model.
+    Use after changing clean_events (filters, merging, date checks)."""
+    key = model_key(model)
+    con = duckdb.connect(db)
+    rows = con.execute(
+        """SELECT x.lr_no, x.payload, r.text FROM extracted.release_extractions x
+           JOIN raw.sec_litigation_releases r USING (lr_no) WHERE x.model = ? AND x.ok""", [key]).fetchall()
+    con.execute(f"DELETE FROM {TABLE} WHERE model = ?", [key])
+    n = 0
+    for lr_no, payload, text in rows:
+        ext = ReleaseExtraction.model_validate_json(payload)
+        for ev in clean_events(ext, text):
+            con.execute(
+                f"INSERT INTO {TABLE} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [lr_no, key, ext.release_kind, ext.is_insider_trading_case, ev["issuer_name"], ev["ticker"],
+                 ev["announcement_date"], ev["date_check"], ev["announcement_evidence"],
+                 ev["last_trade_date"], ev["trade_check"], ev["trade_evidence"], ev["event_type"],
+                 ev["instruments"], ev["direction"]],
+            )
+            n += 1
+    con.close()
+    print(f"Rebuilt {n} events from {len(rows)} stored extractions for {key}")
+
+
 HAND_FIELDS = ["issuer_name", "announcement_date", "event_type", "instruments", "direction"]
 
 
@@ -352,11 +389,16 @@ def main() -> None:
     s.add_argument("--db", default=RELEASES)
     s.add_argument("--model", default=DEFAULT_MODEL)
     s.add_argument("--out", default="data/handcheck.csv")
+    rc = sub.add_parser("reclean")
+    rc.add_argument("--db", default=RELEASES)
+    rc.add_argument("--model", default=DEFAULT_MODEL)
     c = sub.add_parser("score")
     c.add_argument("--csv", default="data/handcheck.csv")
     a = ap.parse_args()
     if a.cmd == "run":
         run(a.db, a.model, a.limit)
+    elif a.cmd == "reclean":
+        reclean(a.db, a.model)
     elif a.cmd == "sample":
         sample(a.db, a.model, a.out)
     else:

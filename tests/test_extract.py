@@ -124,3 +124,26 @@ def test_run_works_on_table_without_primary_key(tmp_path, monkeypatch):
     extract.run(db, "m", None)
     con = duckdb.connect(db)
     assert con.execute("SELECT lr_no, ok FROM extracted.release_extractions").fetchall() == [(1, True)]
+
+
+def test_alias_parenthetical_kept_as_name():
+    from insider_screen.extract import clean_issuer
+    assert clean_issuer('Potash Corporation of Saskatchewan ("Potash")') == "Potash Corporation of Saskatchewan"
+    assert clean_issuer("Acme Corp. (the \u201cCompany\u201d)") == "Acme Corp."
+    assert not is_named(clean_issuer("Post's employer (pharmaceutical company)"))
+
+
+def test_reclean_rebuilds_from_stored_output(tmp_path, monkeypatch):
+    db = str(tmp_path / "t.duckdb")
+    con = duckdb.connect(db)
+    con.execute("CREATE SCHEMA raw")
+    con.execute("CREATE TABLE raw.sec_litigation_releases AS SELECT 1 AS lr_no, ? AS text, TRUE AS is_insider_candidate, 'u' AS url", [TEXT])
+    con.close()
+    monkeypatch.setattr(extract, "call_ollama", lambda text, model, client: ext([ev(issuer_name='Target Co. ("Target")')]))
+    extract.run(db, "m", None)
+    con = duckdb.connect(db)
+    con.execute(f"DELETE FROM {extract.TABLE}")
+    con.close()
+    extract.reclean(db, "m")
+    con = duckdb.connect(db)
+    assert con.execute(f"SELECT issuer_name FROM {extract.TABLE}").fetchall() == [("Target Co.",)]
