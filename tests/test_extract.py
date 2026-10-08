@@ -29,6 +29,10 @@ def test_named_issuers():
     assert not is_named("pharmaceutical company")
     assert not is_named("at least 15 stocks")
     assert not is_named("null") and not is_named(None)
+    assert not is_named("Unknown")
+    assert not is_named("Post's employer (pharmaceutical company)")
+    assert not is_named("Company A")
+    assert is_named("Johnson & Johnson") and is_named("McDonald's Corporation")
 
 
 def test_date_checks():
@@ -78,7 +82,7 @@ def test_run_writes_clean_rows(tmp_path, monkeypatch):
     extract.run(db, "m", None)  # second run skips done releases
     con = duckdb.connect(db)
     rows = con.execute("SELECT model, issuer_name, announcement_date::VARCHAR, date_check FROM extracted.traded_events").fetchall()
-    assert rows == [("m#v3", "Target Co.", "2023-06-05", "verified")]
+    assert rows == [("m#v4", "Target Co.", "2023-06-05", "verified")]
 
 
 def test_trade_date_verified_and_latest_kept():
@@ -114,7 +118,7 @@ def test_run_works_on_table_without_primary_key(tmp_path, monkeypatch):
     con.execute("CREATE SCHEMA raw; CREATE SCHEMA extracted")
     con.execute("CREATE TABLE raw.sec_litigation_releases AS SELECT 1 AS lr_no, ? AS text, TRUE AS is_insider_candidate, 'u' AS url", [TEXT])
     con.execute("""CREATE TABLE extracted.release_extractions AS
-                   SELECT 1 AS lr_no, 'm#v3' AS model, FALSE AS ok, 'timed out' AS error, NULL::JSON AS payload""")
+                   SELECT 1 AS lr_no, 'm#v4' AS model, FALSE AS ok, 'timed out' AS error, NULL::JSON AS payload""")
     con.close()
     monkeypatch.setattr(extract, "call_ollama", lambda text, model, client: ext([ev()]))
     extract.run(db, "m", None)

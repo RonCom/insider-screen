@@ -37,7 +37,7 @@ from insider_screen.db import RELEASES
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:8b")
-PROMPT_VERSION = "v3"
+PROMPT_VERSION = "v4"
 NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "8192"))
 THINK = {"true": True, "false": False}.get(os.environ.get("OLLAMA_THINK", "").lower())
 TABLE = f"extracted.traded_events_{PROMPT_VERSION}"
@@ -101,8 +101,9 @@ announcement_evidence: copy the words from the release that state that date, unc
 last_trade_date: the last date the release says the defendants traded that issuer before the news,
 only if it states the full date. trade_evidence: copy the words that state it, unchanged.
 
-instruments: stock, options, or both. direction: long for buying stock or call options; short for
-short sales or buying puts; both if the release describes each.
+instruments: stock, options, or both. direction: the position taken before the news, ignoring the sale
+or cover that closed it afterward. long for buying stock or call options; short for short sales or buying
+puts; both only if the defendants took long and short positions in that issuer before the news.
 
 Example. Release text: "...Doe bought call options in Acme Corp. ahead of the March 4, 2019 announcement
 that Acme would be acquired by Beta Inc..." Event: issuer_name "Acme Corp.", announcement_date 2019-03-04,
@@ -172,11 +173,15 @@ def check_date(ev: TradedEvent, text: str) -> tuple[date | None, str]:
 
 
 NAMED_RE = re.compile(r"\b[A-Z][A-Za-z0-9&.\-]*")
+DESCRIPTOR_RE = re.compile(
+    r"(?i:\b(?:unknown|unnamed|undisclosed|employer)\b)|\b(?i:company) [A-Z]\b|'s\s+[a-z]|\(")
 UNNAMED_RE = re.compile(r"^(?:a|an|the|at least|several|various|certain|unnamed|unknown|null|none)\b", re.I)
 
 
 def is_named(issuer: str | None) -> bool:
     if not issuer or issuer.strip().lower() in {"null", "none", "n/a"}:
+        return False
+    if DESCRIPTOR_RE.search(issuer):  # "Unknown", "Post's employer (pharmaceutical company)", "Company A"
         return False
     return bool(NAMED_RE.search(issuer)) and not (UNNAMED_RE.match(issuer) and issuer[0].islower())
 
