@@ -58,11 +58,14 @@ uv run python -m insider_screen.edgar download
 uv run python -m insider_screen.edgar load
 
 # 3. Check the timestamps: hour histogram of earnings 8-Ks, then a sample compared with each filing's
-#    index header (Eastern time) by source; `events` converts each source to Eastern from that check
+#    index header (Eastern time). The bulk-file times carry 0, 1 or 2 times the UTC offset.
 uv run python -m insider_screen.edgar check-tz
 uv run python -m insider_screen.edgar tz-sample
 
-# 4. Build events.announcements: earnings, acquisition targets, other material candidates; day 0 per NYSE calendar
+# 4. Build events.announcements, then read exact acceptance times for acquisition targets from their
+#    index headers (~2,700 requests, ~10 minutes) and rebuild. Other events use the earliest consistent day 0.
+uv run python -m insider_screen.edgar events
+uv run python -m insider_screen.edgar exact-times
 uv run python -m insider_screen.edgar events
 ```
 

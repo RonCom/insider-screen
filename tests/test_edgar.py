@@ -70,7 +70,8 @@ def test_load_and_events(tmp_path):
     assert tgt.evidence == "SC14D9C 2023-06-05"
     assert str(tgt.day0.date()) == "2023-06-05"
     assert ("acquisition_target", "0001-23-000001") not in got  # credit agreement, 146 days earlier
-    assert str(got[("earnings", "0001-23-000005")].day0.date()) == "2023-05-03"
+    # JSON 16:05 could be 16:05, 12:05 or 08:05 ET; the earliest day 0 (May 2) is used
+    assert str(got[("earnings", "0001-23-000005")].day0.date()) == "2023-05-02"
     assert ("other_material_candidate", "0001-17-000001") in got  # from the continuation file
     assert not (ev.cik == 1002).any()  # fund excluded
 
@@ -80,40 +81,60 @@ def test_src_tag_and_tz_sample(tmp_path, monkeypatch):
     edgar.load(str(_zip(tmp_path)), db)
     con = duckdb.connect(db)
     assert set(con.execute("SELECT DISTINCT src FROM raw.edgar_filings").fetchall()) == {("recent",), ("file",)}
-    stamps = {a: (t, s) for a, t, s in con.execute("SELECT accession, accepted_json, src FROM raw.edgar_filings").fetchall()}
+    stamps = {a: t for a, t in con.execute("SELECT accession, accepted_json FROM raw.edgar_filings").fetchall()}
     con.close()
 
-    # headers say Eastern time: recent JSON runs 4 hours ahead (UTC in June), continuation files match
     class FakeClient:
         def __init__(self, *a, **k):
             pass
 
         def get(self, url):
             acc = url.rsplit("/", 1)[1].replace("-index-headers.html", "")
-            ts, src = stamps[acc]
-            et = ts - pd.Timedelta(hours=4) if src == "recent" else ts
-            return 200, f"<ACCEPTANCE-DATETIME>{et:%Y%m%d%H%M%S}".encode()
+            return 200, f"<ACCEPTANCE-DATETIME>{stamps[acc] - pd.Timedelta(hours=4):%Y%m%d%H%M%S}".encode()
 
     import insider_screen.http
     monkeypatch.setattr(insider_screen.http, "PoliteClient", FakeClient)
     monkeypatch.setattr(edgar, "ERAS", [("2016-01-01", "2025-12-31")])
-    edgar.tz_sample(db, per_cell=10)
-    con = duckdb.connect(db)
-    assert edgar.tz_rules(con) == {"recent": "UTC", "file": "ET"}
-    con.close()
+    s = edgar.tz_sample(db, per_cell=10)
+    assert set(s.offset_hours.dropna()) == {4.0}
 
+
+def test_resolved_day0_never_after_true_day0():
+    """Whatever multiple of the UTC offset the JSON time carries, the day 0 used is never later than
+    the true one, so the announcement can't fall inside the pre-event window."""
+    import random
+    cal = xc.get_calendar("XNYS", start="2015-01-01")
+    sessions = cal.sessions
+    rng = random.Random(7)
+    true_et, json_ts, fdates = [], [], []
+    for _ in range(300):
+        d = sessions[rng.randrange(100, len(sessions) - 300)]
+        et = d + pd.Timedelta(minutes=rng.randrange(6 * 60, 22 * 60))
+        k = rng.choice([0, 1, 2])
+        true_et.append(et)
+        json_ts.append(et + pd.Timedelta(hours=k * edgar._ny_offset_hours(et)))
+        fdates.append(edgar._filing_date_for(et, sessions))
+    res = edgar.resolve_times(pd.Series(json_ts), pd.Series(fdates), cal)
+    truth = edgar.day0(pd.Series(true_et), cal)
+    assert (res.day0 <= truth).all()
+    assert (res.day0[res.day0_candidates == 1] == truth[res.day0_candidates == 1]).all()
+
+
+def test_exact_times_override(tmp_path, monkeypatch):
+    db = str(tmp_path / "t.duckdb")
+    edgar.load(str(_zip(tmp_path)), db)
+    edgar.build_events(db, start="2016-01-01", end="2025-12-31")
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def get(self, url):
+            return 200, b"<ACCEPTANCE-DATETIME>20230605161000"  # after the close: day 0 moves to June 6
+
+    import insider_screen.http
+    monkeypatch.setattr(insider_screen.http, "PoliteClient", FakeClient)
+    edgar.fetch_exact_times(db, "acquisition_target")
     ev = edgar.build_events(db, start="2016-01-01", end="2025-12-31")
-    tgt = ev[ev.accession == "0001-23-000002"].iloc[0]  # JSON 07:15 read as UTC -> 03:15 ET, still pre-open
-    assert str(tgt.accepted_et) == "2023-06-05 03:15:00" and str(tgt.day0.date()) == "2023-06-05"
-    earn = ev[ev.accession == "0001-23-000005"].iloc[0]  # JSON 16:05 UTC -> 12:05 ET, during the session
-    assert str(earn.day0.date()) == "2023-05-02"
-
-
-def test_mixed_offsets_stop_events(tmp_path):
-    import pytest
-    db = str(tmp_path / "m.duckdb")
-    con = duckdb.connect(db)
-    con.execute("CREATE SCHEMA raw")
-    con.execute("CREATE TABLE raw.edgar_tz_check AS SELECT * FROM (VALUES ('recent', 0.0), ('recent', 4.0)) t(src, offset_hours)")
-    with pytest.raises(SystemExit):
-        edgar.tz_rules(con)
+    tgt = ev[(ev.event_type == "acquisition_target")].iloc[0]
+    assert (tgt.day0_basis, str(tgt.day0.date())) == ("index_header", "2023-06-06")

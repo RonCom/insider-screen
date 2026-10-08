@@ -28,7 +28,7 @@ No free source has expired option contracts back to 2017, so the options feature
   - M&A target: Item 1.01 with a merger agreement exhibit, where the filer is the target
   - Earnings: Item 2.02
   - Other material: Item 8.01 or 7.01 with a same-day absolute abnormal return above 10%
-- **Event day 0:** the 8-K acceptance time. A filing accepted after 16:00 ET sets day 0 to the next trading day. For 50 sampled M&A events, the 8-K time is compared against the press-release time; if more than 5 of the 50 differ by a trading day or more, day 0 switches to the press-release time.
+- **Event day 0:** the 8-K acceptance time. A filing accepted after 16:00 ET sets day 0 to the next trading day. Acquisition targets take the acceptance time from the filing's index header. Other events take the earliest day 0 consistent with EDGAR's hours and the filing date, because the bulk-file time can carry 0, 1 or 2 times the UTC offset; the pre-event window then never contains the announcement, and an ambiguous event can lose its last pre-event day. For 50 sampled M&A events, the 8-K time is compared against the press-release time; if more than 5 of the 50 differ by a trading day or more, day 0 switches to the press-release time.
 
 ## Labels
 
@@ -105,3 +105,4 @@ uv, DuckDB, dbt with a Snowflake target, MLflow for runs, Streamlit alert queue 
 | 2026-10-08 | Alpaca's free plan replaces Massive for daily stock bars; Massive's free reference data supplies the ticker-to-CIK map | Free source that passed the delisted-ticker pre-check (CELG, TWTR, ATVI returned full bars). Massive stocks would cost $79–199 for the history needed. Before any price data pull. |
 | 2026-10-08 | Development period starts in 2017 (was 2016); question range is 2017–2025 | Alpaca's history starts in January 2016 (a request for January 2015 returned no bars), so 2016 events have no full −250-day baseline. Test period unchanged. Before any price data pull. |
 | 2026-10-08 | Options features and shrinkage dropped; H2 and H4 reported as not tested | No free source of expired option contracts back to 2017 (Twelve Data, Yahoo Finance, Interactive Brokers and Alpaca checked); the spec's fallback for a failed options pre-check. Before any price data pull. |
+| 2026-10-08 | Day 0 from index headers for acquisition targets; earliest consistent day 0 for other events | A check of 90 bulk-file times against filing index headers found offsets of 0, 4–5 and 8–10 hours from Eastern time in both parts of the bulk file. Before any feature was computed. |

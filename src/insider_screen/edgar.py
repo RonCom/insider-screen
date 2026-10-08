@@ -13,16 +13,20 @@ Event types (spec, "Events"):
 - other_material_candidate: 8-K with Item 7.01 or 8.01 and neither 1.01 nor 2.02. The spec keeps
   these only if the day-0 abnormal return exceeds 10%, which needs prices (later step).
 
-Timestamps: acceptanceDateTime ends in "Z", but the hour histogram of earnings 8-Ks mixes Eastern-time
-and UTC peaks, with the UTC share rising year by year. `tz-sample` compares a sample against each
-filing's index header (Eastern time), by source: the filer's "recent" block or its continuation files.
-`events` converts each source to Eastern time from that check.
+Timestamps: acceptanceDateTime ends in "Z", but `tz-sample` (a sample checked against each filing's
+index header, which gives Eastern time) found it runs 0, 1 or 2 times the UTC offset ahead of Eastern
+time, in both the recent block and the continuation files. `events` keeps the earliest day 0 that fits
+EDGAR's hours and the filing date, so an ambiguous time never puts the announcement inside the
+pre-event window. `exact-times` reads the index header for every event of one type (acquisition
+targets by default); `events` then uses those exact times.
 
 Usage:
     uv run python -m insider_screen.edgar download
     uv run python -m insider_screen.edgar load
     uv run python -m insider_screen.edgar check-tz
     uv run python -m insider_screen.edgar tz-sample
+    uv run python -m insider_screen.edgar events
+    uv run python -m insider_screen.edgar exact-times
     uv run python -m insider_screen.edgar events
 """
 
@@ -33,6 +37,7 @@ import json
 import re
 import zipfile
 from datetime import datetime, time
+from functools import lru_cache
 from pathlib import Path
 
 import duckdb
@@ -207,38 +212,89 @@ def tz_sample(db: str, per_cell: int = 15, seed: int = 42) -> pd.DataFrame:
     return sample
 
 
-def tz_rules(con) -> dict[str, str]:
-    """Per source: 'ET' if the JSON time equals Eastern time, 'UTC' if it runs 4-5 hours ahead."""
-    try:
-        df = con.execute("SELECT src, offset_hours FROM raw.edgar_tz_check WHERE offset_hours IS NOT NULL").df()
-    except duckdb.CatalogException:
-        print("No tz check found (run `edgar tz-sample`); reading all timestamps as Eastern time.")
-        return {"recent": "ET", "file": "ET"}
-    rules = {}
-    for src, g in df.groupby("src"):
-        vals = set(g.offset_hours.round().astype(int))
-        if vals <= {0}:
-            rules[src] = "ET"
-        elif vals <= {4, 5}:
-            rules[src] = "UTC"
-        else:
-            raise SystemExit(f"Timestamps in '{src}' are mixed ({sorted(vals)} hours); day 0 can't be set by source.")
-    return rules
+EDGAR_OPEN, EDGAR_CLOSE = time(6, 0), time(22, 0)
+FILING_CUTOFF = time(17, 30)  # accepted after 17:30 ET -> filing date is the next business day
 
 
-def to_eastern(ts: pd.Series, src: pd.Series, rules: dict[str, str]) -> pd.Series:
-    ts = pd.to_datetime(ts)
-    utc = src.map(rules).eq("UTC")
-    out = ts.copy()
-    if utc.any():
-        out[utc] = (ts[utc].dt.tz_localize("UTC").dt.tz_convert("America/New_York").dt.tz_localize(None))
-    return out
+@lru_cache(maxsize=None)
+def _offset_for_date(d) -> int:
+    noon = pd.Timestamp(d) + pd.Timedelta(hours=12)
+    return int(-noon.tz_localize("America/New_York").utcoffset().total_seconds() // 3600)
+
+
+def _ny_offset_hours(ts: pd.Timestamp) -> int:
+    """Hours Eastern time is behind UTC on that date: 4 (daylight) or 5 (standard)."""
+    return _offset_for_date(ts.date())
+
+
+def _day0_one(ts: pd.Timestamp, sessions: pd.DatetimeIndex, session_set: set) -> pd.Timestamp:
+    d = pd.Timestamp(ts.date())
+    if d in session_set and ts.time() < MARKET_CLOSE:
+        return d
+    i = sessions.searchsorted(d, side="right")
+    return sessions[i] if i < len(sessions) else pd.NaT
+
+
+def _filing_date_for(et: pd.Timestamp, sessions: pd.DatetimeIndex) -> pd.Timestamp:
+    d = pd.Timestamp(et.date())
+    if et.time() <= FILING_CUTOFF and d in sessions:
+        return d
+    return sessions[sessions.searchsorted(d, side="right")]
+
+
+def resolve_times(json_ts: pd.Series, filing_date: pd.Series, cal: xc.ExchangeCalendar) -> pd.DataFrame:
+    """Candidate Eastern times for each filing: JSON time minus 0, 1 or 2 times the UTC offset (the
+    tz-sample check found all three). Candidates outside EDGAR hours (06:00-22:00 ET) or inconsistent
+    with the filing date are dropped. Returns the earliest surviving candidate, its day 0, and how many
+    distinct day-0 values survived. Taking the earliest keeps the announcement out of the pre-event
+    window when the time is ambiguous; it can cost the last pre-event day."""
+    sessions = cal.sessions
+    session_set = set(sessions)
+    rows = []
+    for j, f in zip(pd.to_datetime(json_ts), pd.to_datetime(filing_date)):
+        if pd.isna(j):
+            rows.append((pd.NaT, pd.NaT, 0))
+            continue
+        off = _ny_offset_hours(j)
+        cands = [j - pd.Timedelta(hours=k * off) for k in (0, 1, 2)]
+        ok = [c for c in cands if EDGAR_OPEN <= c.time() <= EDGAR_CLOSE]
+        both = [c for c in ok if pd.isna(f) or _filing_date_for(c, sessions) == pd.Timestamp(f)]
+        keep = both or ok or cands
+        d0 = [_day0_one(c, sessions, session_set) for c in keep]
+        i = min(range(len(keep)), key=lambda k: d0[k])
+        rows.append((keep[i], d0[i], len(set(d0))))
+    return pd.DataFrame(rows, columns=["accepted_et", "day0", "day0_candidates"], index=json_ts.index)
+
+
+def fetch_exact_times(db: str, event_type: str = "acquisition_target") -> None:
+    """Acceptance time from each event filing's index header (Eastern time) into raw.edgar_exact_times.
+    Rerun `events` afterwards to use them. Already-fetched filings are skipped."""
+    from insider_screen.http import PoliteClient
+
+    con = duckdb.connect(db)
+    con.execute("CREATE TABLE IF NOT EXISTS raw.edgar_exact_times (accession VARCHAR, cik BIGINT, accepted_et TIMESTAMP)")
+    todo = con.execute(
+        """SELECT DISTINCT cik, accession FROM events.announcements WHERE event_type = ?
+           AND accession NOT IN (SELECT accession FROM raw.edgar_exact_times)""", [event_type]).fetchall()
+    print(f"{len(todo)} {event_type} filings to look up")
+    client = PoliteClient(cache_dir="data/cache/sec")
+    missing = 0
+    for i, (cik, acc) in enumerate(todo, 1):
+        status, body = client.get(HEADER_URL.format(cik=int(cik), folder=acc.replace("-", ""), acc=acc))
+        m = ACCEPT_RE.search(body.decode("latin-1")) if status == 200 else None
+        if not m:
+            missing += 1
+            continue
+        con.execute("INSERT INTO raw.edgar_exact_times VALUES (?, ?, ?)",
+                    [acc, int(cik), datetime.strptime(m.group(1), "%Y%m%d%H%M%S")])
+        if i % 500 == 0:
+            print(f"  {i}/{len(todo)}")
+    con.close()
+    print(f"Done; {missing} headers not found")
 
 
 def build_events(db: str, start: str = "2016-01-01", end: str = "2025-12-31") -> pd.DataFrame:
     con = duckdb.connect(db)
-    rules = tz_rules(con)
-    print(f"Timestamp reading by source: {rules}")
     universe = con.execute(
         """SELECT DISTINCT f.cik FROM raw.edgar_filings f JOIN raw.edgar_companies c USING (cik)
            WHERE f.form IN ('10-K', '10-Q') AND f.filing_date BETWEEN ? AND ?
@@ -251,7 +307,6 @@ def build_events(db: str, start: str = "2016-01-01", end: str = "2025-12-31") ->
            WHERE form = '8-K' AND filing_date BETWEEN ? AND ? AND cik IN (SELECT cik FROM universe)""",
         [start, end],
     ).df()
-    eightk["accepted_et"] = to_eastern(eightk.accepted_json, eightk.src, rules)
     target_forms = con.execute(
         f"""SELECT cik, form, filing_date FROM raw.edgar_filings
             WHERE form IN ({",".join("'" + f + "'" for f in TARGET_FORMS)})
@@ -275,7 +330,7 @@ def build_events(db: str, start: str = "2016-01-01", end: str = "2025-12-31") ->
     deals = eightk[eightk.i101].merge(tf, on="cik", suffixes=("", "_t"))
     lag = (pd.to_datetime(deals.filing_date_t) - pd.to_datetime(deals.filing_date)).dt.days
     deals = deals[(lag >= 0) & (lag <= TARGET_WINDOW_DAYS)]
-    deals = deals.sort_values(["cik", "filing_date_t", "accepted_et"]).drop_duplicates(["cik", "filing_date_t"])
+    deals = deals.sort_values(["cik", "filing_date_t", "accepted_json"]).drop_duplicates(["cik", "filing_date_t"])
     events.append(deals.assign(
         event_type="acquisition_target",
         evidence=deals.form + " " + pd.to_datetime(deals.filing_date_t).dt.strftime("%Y-%m-%d"),
@@ -285,10 +340,24 @@ def build_events(db: str, start: str = "2016-01-01", end: str = "2025-12-31") ->
     events.append(o.assign(event_type="other_material_candidate", evidence=""))
 
     ev = pd.concat(events, ignore_index=True)[
-        ["cik", "accession", "filing_date", "accepted_et", "items", "event_type", "evidence"]
+        ["cik", "accession", "filing_date", "accepted_json", "items", "event_type", "evidence"]
     ]
     cal = xc.get_calendar("XNYS", start="2015-01-01")
-    ev["day0"] = day0(pd.to_datetime(ev.accepted_et), cal)
+    res = resolve_times(ev.accepted_json, ev.filing_date, cal)
+    ev["accepted_et"], ev["day0"], ev["day0_candidates"] = res.accepted_et, res.day0, res.day0_candidates
+    ev["day0_basis"] = "earliest_candidate"
+    try:
+        exact = con.execute("SELECT accession, accepted_et AS header_et FROM raw.edgar_exact_times").df()
+    except duckdb.CatalogException:
+        exact = pd.DataFrame(columns=["accession", "header_et"])
+    if len(exact):
+        ev = ev.merge(exact, on="accession", how="left")
+        has = ev.header_et.notna()
+        ev.loc[has, "accepted_et"] = pd.to_datetime(ev.loc[has, "header_et"])
+        ev.loc[has, "day0"] = day0(pd.to_datetime(ev.loc[has, "header_et"]), cal).values
+        ev.loc[has, "day0_candidates"] = 1
+        ev.loc[has, "day0_basis"] = "index_header"
+        ev = ev.drop(columns="header_et")
     ev = ev.drop_duplicates(["accession", "event_type"]).sort_values(["day0", "cik"])
     ev.insert(0, "event_id", ev.event_type.str[:3] + "-" + ev.accession)
 
@@ -299,8 +368,13 @@ def build_events(db: str, start: str = "2016-01-01", end: str = "2025-12-31") ->
         """SELECT event_type, year(day0) AS year, count(*) AS n FROM events.announcements
            GROUP BY 1, 2 ORDER BY 1, 2"""
     ).df()
+    basis = con.execute(
+        """SELECT event_type, day0_basis, (day0_candidates > 1) AS ambiguous, count(*) AS n
+           FROM events.announcements GROUP BY ALL ORDER BY ALL""").df()
     con.close()
     print(summary.pivot(index="year", columns="event_type", values="n").to_string())
+    print("\nDay 0 basis (ambiguous = more than one possible day 0; the earliest is used):")
+    print(basis.to_string(index=False))
     return ev
 
 
@@ -316,6 +390,9 @@ def main() -> None:
     t.add_argument("--db", default=EDGAR)
     ts = sub.add_parser("tz-sample")
     ts.add_argument("--db", default=EDGAR)
+    xt = sub.add_parser("exact-times")
+    xt.add_argument("--db", default=EDGAR)
+    xt.add_argument("--event-type", default="acquisition_target")
     e = sub.add_parser("events")
     e.add_argument("--db", default=EDGAR)
     e.add_argument("--start", default="2016-01-01")
@@ -329,6 +406,8 @@ def main() -> None:
         check_tz(a.db)
     elif a.cmd == "tz-sample":
         tz_sample(a.db)
+    elif a.cmd == "exact-times":
+        fetch_exact_times(a.db, a.event_type)
     else:
         build_events(a.db, a.start, a.end)
 
