@@ -114,3 +114,7 @@ def test_bad_file_is_skipped_not_fatal():
     df, got = ss.fetch_day(Bad(), date(2016, 3, 1))
     assert got == ["FNSQ"] and len(df) == 1
     assert ss.BAD_FILES and "FNYXshvol20160301" in ss.BAD_FILES[-1][0]
+
+def test_header_and_trailer_only():
+    df = ss.parse_daily("Date|Symbol|ShortVolume|ShortExemptVolume|TotalVolume|Market\n0\n")
+    assert df.empty and "short_volume" in df.columns

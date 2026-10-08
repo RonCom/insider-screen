@@ -54,6 +54,8 @@ def parse_daily(text: str) -> pd.DataFrame:
         return pd.DataFrame(columns=["date", "symbol", "short_volume", "short_exempt_volume", "total_volume"])
     header = [h.strip().lower().replace(" ", "") for h in lines[0].split("|")]
     rows = [ln.split("|") for ln in lines[1:] if ln.count("|") >= 3]
+    if not rows:  # header and trailer only: nothing reported to this facility that day
+        return pd.DataFrame(columns=["date", "symbol", "short_volume", "short_exempt_volume", "total_volume"])
     df = pd.DataFrame(rows).iloc[:, : len(header)]
     df.columns = header[: df.shape[1]]
     rename = {"date": "date", "symbol": "symbol", "shortvolume": "short_volume",
