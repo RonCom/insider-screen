@@ -77,6 +77,12 @@ def fetch_bars(api: Alpaca, symbols: list[str], start: str, end: str, adjustment
         if token:
             params["page_token"] = token
         r = api.get(params)
+        if r.status_code in (401, 403):
+            key = api.client.headers.get("APCA-API-KEY-ID", "")
+            raise SystemExit(
+                f"Alpaca rejected the credentials ({r.status_code}: {r.text[:120]}). Key ID starts {key[:2]!r}, "
+                f"{len(key)} characters. Check ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY in .env, and that no "
+                "variable of the same name is set in the shell (it takes precedence over .env).")
         r.raise_for_status()
         body = r.json()
         for sym, bars in (body.get("bars") or {}).items():

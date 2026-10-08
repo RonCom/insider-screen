@@ -53,3 +53,10 @@ def test_load_resumes_and_adds_market(tmp_path):
     calls.clear()
     prices.load(make_api(handler), db, "2018-01-01", "2018-01-05", ["AAA", "brk/b", "GONE"])
     assert calls == []
+
+
+def test_rejected_credentials_exit_with_hint():
+    import pytest
+    api = make_api(lambda request: httpx.Response(401, json={"message": "unauthorized."}))
+    with pytest.raises(SystemExit, match="Key ID starts 'k'"):
+        prices.fetch_bars(api, ["AAA"], "2018-01-01", "2018-01-05", "raw")
