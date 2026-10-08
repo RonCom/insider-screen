@@ -108,8 +108,9 @@ def match(traded: pd.DataFrame, companies: pd.DataFrame, events: pd.DataFrame,
                     rows.append({**base, "reason": "no_dates"})
                     continue
                 targets = cands[cands.event_type == "acquisition_target"]
-                years = {int(y) for y in re.findall(r"\b((?:19|20)\d{2})\b",
-                                                     getattr(t, "announcement_evidence", None) or "")}
+                quote = getattr(t, "announcement_evidence", None)
+                quote = quote if isinstance(quote, str) else ""  # missing values arrive as NaN
+                years = {int(y) for y in re.findall(r"\b((?:19|20)\d{2})\b", quote)}
                 if len(targets) > 1 and years:
                     targets = targets[pd.to_datetime(targets.day0).dt.year.isin(years)]
                 if len(targets) != 1:

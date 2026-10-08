@@ -93,3 +93,7 @@ def test_target_disambiguated_by_quoted_year():
     assert match(traded("Kindred Biosciences", None), COMPANIES, events, CAL).iloc[0].reason == "ambiguous_target"
     out = match(traded("Kindred Biosciences", None, quote="the 2021 announcement of a merger"), COMPANIES, events, CAL).iloc[0]
     assert out.event_id == "acq-1"
+
+def test_missing_quote_as_nan():
+    t = traded("Kindred Biosciences", None, quote=float("nan"))
+    assert match(t, COMPANIES, EVENTS, CAL).iloc[0].event_id == "acq-1"
