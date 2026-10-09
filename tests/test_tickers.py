@@ -300,3 +300,15 @@ def test_untyped_delisted_rows_kept_unless_not_stock(tmp_path):
     out = tk.build(db)
     assert sorted(out.ticker) == ["OLDC", "TYPED"]
     assert dict(zip(out.ticker, out.type)) == {"OLDC": "untyped", "TYPED": "CS"}
+
+
+def test_release_ticker_gets_a_date(monkeypatch):
+    """DuckDB returns list elements as datetime; the filing-date comparisons need a date."""
+    from datetime import date, datetime
+
+    from insider_screen import market_move
+    seen = []
+    monkeypatch.setattr(market_move, "release_ticker", lambda sec, url, filed, company: seen.append(filed) or (None, "x"))
+    tk._release_ticker(None, 1, "0001-18-000004", "Gone Corp", datetime(2018, 5, 1))
+    tk._release_ticker(None, 1, "0001-18-000004", "Gone Corp", pd.NaT)
+    assert seen == [date(2018, 5, 1), None] and type(seen[0]) is date

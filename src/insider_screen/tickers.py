@@ -298,6 +298,8 @@ def _index_url(cik: int, accession: str) -> str:
 def _release_ticker(sec, cik: int, accession: str, company: str, filed=None) -> tuple[str | None, str]:
     """Ticker from the 8-K's press release, its body, or (with `filed`) the company's other filings that day."""
     from insider_screen.market_move import release_ticker
+    # DuckDB hands list elements back as datetime, which can't be compared with the filing dates
+    filed = None if filed is None or pd.isna(filed) else pd.Timestamp(filed).date()
     try:
         return release_ticker(sec, _index_url(cik, accession), filed, company)
     except Exception as err:  # one bad filing shouldn't stop the run
