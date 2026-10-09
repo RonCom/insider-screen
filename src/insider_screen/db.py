@@ -6,6 +6,7 @@ write a file at a time: a price load and an extraction can then run side by side
     data/finra.duckdb   shortsale daily and monthly
     data/prices.duckdb  prices
     data/reference.duckdb  tickers (Massive reference data, ticker-to-CIK map)
+    data/features.duckdb  features (pre-event features per event)
 
 Steps that read another file attach it read-only, which fails while that file's loader is running.
 
@@ -26,6 +27,7 @@ EDGAR = "data/edgar.duckdb"
 FINRA = "data/finra.duckdb"
 PRICES = "data/prices.duckdb"
 REFERENCE = "data/reference.duckdb"
+FEATURES = "data/features.duckdb"
 OLD = "data/insider.duckdb"
 
 # (schema, table prefix) -> file; first match wins
@@ -35,6 +37,7 @@ ROUTES = [
     ("raw", "finra_", FINRA),
     ("raw", "alpaca_", PRICES),
     ("raw", "massive_", REFERENCE), ("ref", "", REFERENCE),
+    ("features", "", FEATURES),
 ]
 
 
