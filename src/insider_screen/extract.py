@@ -137,6 +137,24 @@ def model_key(model: str) -> str:
     return f"{model}#{PROMPT_VERSION}"
 
 
+WAIT_FOR_OLLAMA = 600  # seconds to keep retrying when Ollama isn't answering (starting up, loading the model)
+
+
+def _post_waiting(client: httpx.Client, payload: dict) -> httpx.Response:
+    """POST to Ollama; if it refuses the connection, wait and retry for up to WAIT_FOR_OLLAMA seconds."""
+    waited, step = 0, 10
+    while True:
+        try:
+            return client.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=900)
+        except httpx.ConnectError:
+            if waited >= WAIT_FOR_OLLAMA:
+                raise
+            print(f"    Ollama not answering at {OLLAMA_URL}; retrying in {step} s "
+                  f"(is `ollama serve` or the Ollama app running?)", flush=True)
+            time.sleep(step)
+            waited += step
+
+
 def call_ollama(text: str, model: str, client: httpx.Client) -> ReleaseExtraction:
     payload = {
         "model": model,
@@ -151,9 +169,13 @@ def call_ollama(text: str, model: str, client: httpx.Client) -> ReleaseExtractio
     }
     last_err: Exception | None = None
     for _ in range(2):
-        resp = client.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=600)
+        resp = _post_waiting(client, payload)
         resp.raise_for_status()
-        content = resp.json()["message"]["content"]
+        body = resp.json()
+        content = body["message"]["content"]
+        if body.get("done_reason") == "length":  # output cut off: the JSON can't parse
+            last_err = ValueError(f"output cut off at the token limit ({len(content)} characters)")
+            continue
         try:
             return ReleaseExtraction.model_validate_json(content)
         except ValidationError as err:
@@ -364,10 +386,11 @@ def run(db: str, model: str, limit: int | None, lrs_from: str | None = None) -> 
                 con.execute(f"DELETE FROM {TABLE} WHERE lr_no = ? AND model = ?", [lr_no, key])
                 n_events = _insert_events(con, lr_no, key, ext, text)
                 status = f"{n_events} event{'s' if n_events != 1 else ''}"
-            except (ValidationError, httpx.HTTPError, KeyError) as err:
+            except (ValidationError, ValueError, httpx.HTTPError, KeyError) as err:
                 _record(con, (lr_no, key, False, str(err)[:500], None))
                 failed_n += 1
-                status = f"FAILED ({type(err).__name__})"
+                first = str(err).strip().splitlines()[0][:120] if str(err).strip() else ""
+                status = f"FAILED ({type(err).__name__}: {first})"
             took = time.monotonic() - t0
             elapsed = time.monotonic() - start
             left = (len(todo) - i) * elapsed / i
