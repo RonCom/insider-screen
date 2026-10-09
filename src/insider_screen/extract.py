@@ -134,7 +134,9 @@ last_trade_date null (no trade date stated), event_type acquisition_target, inst
 
 
 def model_key(model: str) -> str:
-    return f"{model}#{PROMPT_VERSION}"
+    """Rows are stored per model, prompt version and reasoning setting, so a run with OLLAMA_THINK=false
+    never mixes with (or skips because of) a run with reasoning on."""
+    return f"{model}#{PROMPT_VERSION}{'-nothink' if THINK is False else ''}"
 
 
 WAIT_FOR_OLLAMA = 600  # seconds to keep retrying when Ollama isn't answering (starting up, loading the model)
