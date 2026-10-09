@@ -455,10 +455,11 @@ def compare(db: str, model: str, csv: str) -> tuple[float, float]:
         best = max(names, default=(0, None))
         if best[0] >= 85:
             issuer_hits += 1
-            if (best[1] or "") == (r.announcement_date or ""):
+            if ("" if pd.isna(best[1]) else best[1]) == (r.announcement_date or ""):  # both missing counts
                 date_hits += 1
             else:
-                misses.append((r.lr_no, r.issuer_name, f"date {best[1]} vs {r.announcement_date or 'none'}"))
+                misses.append((r.lr_no, r.issuer_name, f"date {'none' if pd.isna(best[1]) else best[1]} vs "
+                                                        f"{r.announcement_date or 'none'}"))
         else:
             misses.append((r.lr_no, r.issuer_name, "issuer not found"))
     n = len(known)

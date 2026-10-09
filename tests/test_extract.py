@@ -217,11 +217,15 @@ def test_compare_against_reviewed_handcheck(tmp_path):
     con.execute(f"""CREATE TABLE {ex.TABLE} AS SELECT * FROM (VALUES
         (1, '{ex.model_key("small")}', 'Acme Corp.', DATE '2020-01-02'),
         (2, '{ex.model_key("small")}', 'Beta Inc', DATE '2020-05-05'),
-        (3, '{ex.model_key("small")}', 'Lumentum', DATE '2021-01-19')) t(lr_no, model, issuer_name, announcement_date)""")
+        (3, '{ex.model_key("small")}', 'Lumentum', DATE '2021-01-19'),
+        (5, '{ex.model_key("small")}', 'Delta Co', NULL)) t(lr_no, model, issuer_name, announcement_date)""")
     con.close()
     csv = tmp_path / "h.csv"
-    pd.DataFrame({"lr_no": ["1", "2", "3", "4"], "issuer_name": ["Acme Corporation", "Beta, Inc.", "Coherent", "Old"],
-                  "announcement_date": ["2020-01-02", "2020-05-06", "2021-01-19", ""],
-                  "ok_issuer_name": ["Y", "Y", "Y", "N"], "ok_announcement_date": ["Y", "Y", "Y", "Y"]}).to_csv(csv, index=False)
+    pd.DataFrame({"lr_no": ["1", "2", "3", "4", "5"],
+                  "issuer_name": ["Acme Corporation", "Beta, Inc.", "Coherent", "Old", "Delta Company"],
+                  "announcement_date": ["2020-01-02", "2020-05-06", "2021-01-19", "", ""],
+                  "ok_issuer_name": ["Y", "Y", "Y", "N", "Y"],
+                  "ok_announcement_date": ["Y", "Y", "Y", "Y", "Y"]}).to_csv(csv, index=False)
     ir, dr = ex.compare(db, "small", str(csv))
-    assert (round(ir, 3), round(dr, 3)) == (0.667, 0.333)
+    # Delta: no date in the release and none extracted counts as a match
+    assert (ir, dr) == (0.75, 0.5)
