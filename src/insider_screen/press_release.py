@@ -13,16 +13,19 @@ from __future__ import annotations
 import base64
 import json
 import re
+import warnings
 from dataclasses import dataclass
 from datetime import date
 from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
 
 import httpx
 import pandas as pd
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from rapidfuzz import fuzz
 
 EASTERN = "America/New_York"
+# a few EDGAR documents are XML; the HTML parser still reads their text
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/124.0 Safari/537.36")
 BROWSER_HEADERS = {
