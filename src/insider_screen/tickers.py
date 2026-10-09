@@ -147,14 +147,24 @@ def build(db: str = REFERENCE) -> pd.DataFrame:
     out = ticker_ranges(raw)
     con.execute("CREATE SCHEMA IF NOT EXISTS ref")
     con.register("out", out)
-    con.execute("CREATE OR REPLACE TABLE ref.ticker_cik AS SELECT * FROM out")
+    con.execute("""CREATE OR REPLACE TABLE ref.ticker_cik AS
+                   SELECT ticker, CAST(cik AS BIGINT) AS cik, name, type, primary_exchange, composite_figi,
+                          CAST(active AS BOOLEAN) AS active,
+                          CAST(valid_from AS DATE) AS valid_from, CAST(valid_to AS DATE) AS valid_to
+                   FROM out""")
     con.unregister("out")
     stats = con.execute("""SELECT count(*) AS rows, count(DISTINCT ticker) AS tickers, count(DISTINCT cik) AS ciks,
                                   sum((cik IS NULL)::INT) AS rows_without_cik,
-                                  count(*) - count(DISTINCT ticker) AS reused_ticker_rows
+                                  count(*) - count(DISTINCT ticker) AS reused_ticker_rows,
+                                  sum((NOT active)::INT) AS delisted_rows, count(valid_to) AS rows_with_end_date
                            FROM ref.ticker_cik""").df()
+    by_list = con.execute("""SELECT active, count(*) AS rows, count(delisted_utc) AS with_delisting_date,
+                                    min(delisted_utc) AS earliest_delisting, max(delisted_utc) AS latest_delisting
+                             FROM raw.massive_tickers GROUP BY 1 ORDER BY 1""").df()
     con.close()
     print(stats.to_string(index=False))
+    print("\nDownloaded, all security types:")
+    print(by_list.to_string(index=False))
     return out
 
 

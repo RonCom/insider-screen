@@ -99,3 +99,19 @@ def test_rejected_key_message():
                      per_minute=100000)
     with pytest.raises(SystemExit, match="MASSIVE_API_KEY"):
         api.get("/v3/reference/tickers")
+
+
+def test_all_null_dates_still_typed(tmp_path):
+    """No reused tickers and no delistings: the date columns must still be DATE, or the day-0 join fails."""
+    db = str(tmp_path / "reference.duckdb")
+    con = duckdb.connect(db)
+    tk._setup(con)
+    con.execute("INSERT INTO raw.massive_tickers VALUES ('AAA', '0000000001', 'A', 'CS', TRUE, 'XNYS', NULL, NULL, NULL, NULL, now())")
+    con.close()
+    tk.build(db)
+    con = duckdb.connect(db)
+    types = dict(con.execute("SELECT column_name, data_type FROM information_schema.columns "
+                             "WHERE table_name = 'ticker_cik'").fetchall())
+    assert types["valid_from"] == "DATE" and types["valid_to"] == "DATE"
+    con.execute("CREATE TABLE ev AS SELECT 'e1' AS event_id, 1::BIGINT AS cik, TIMESTAMP '2023-01-05' AS day0")
+    assert con.execute(tk.TICKER_ON_SQL.format(events="ev", map="ref.ticker_cik")).fetchall()[0][-1] == "AAA"
