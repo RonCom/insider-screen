@@ -173,8 +173,13 @@ def call_ollama(text: str, model: str, client: httpx.Client) -> ReleaseExtractio
         resp.raise_for_status()
         body = resp.json()
         content = body["message"]["content"]
-        if body.get("done_reason") == "length":  # output cut off: the JSON can't parse
-            last_err = ValueError(f"output cut off at the token limit ({len(content)} characters)")
+        if body.get("done_reason") == "length":
+            # the context filled before the answer finished (a long release, or long reasoning): retry once
+            # with twice the context, same input; only these releases pay for the larger context
+            thought = len(body["message"].get("thinking") or "")
+            last_err = ValueError(f"output cut off at the token limit ({len(content)} characters of answer, "
+                                  f"{thought} of reasoning, context {payload['options']['num_ctx']})")
+            payload = {**payload, "options": {**payload["options"], "num_ctx": NUM_CTX * 2}}
             continue
         try:
             return ReleaseExtraction.model_validate_json(content)
