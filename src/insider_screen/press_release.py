@@ -243,14 +243,19 @@ DOC_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{folder}/{doc}"
 RELATED_FORMS = {"8-K", "425", "DEFA14A", "SC14D9C", "SC 14D9-C", "SC TO-C", "8-K12B", "6-K"}
 
 
-def _filings(sec, cik: int) -> pd.DataFrame:
-    """All of a filer's filings from the submissions API, including the older pages."""
+def _filings(sec, cik: int, day: date | None = None) -> pd.DataFrame:
+    """A filer's filings from the submissions API. Older filings sit on extra pages, each covering a date
+    range; only the pages covering `day` are fetched (long-time filers have many, megabytes each)."""
     status, body = sec.get(SUBMISSIONS_URL.format(cik=cik))
     if status != 200:
         return pd.DataFrame()
     data = json.loads(body)
     blocks = [data.get("filings", {}).get("recent", {})]
     for f in data.get("filings", {}).get("files", []):
+        lo, hi = f.get("filingFrom"), f.get("filingTo")
+        if day is not None and lo and hi and not (pd.Timestamp(lo).date() <= day <= pd.Timestamp(hi).date()
+                                                  + pd.Timedelta(days=1)):
+            continue
         st, b = sec.get("https://data.sec.gov/submissions/" + f["name"])
         if st == 200:
             blocks.append(json.loads(b))
@@ -262,7 +267,7 @@ def _filings(sec, cik: int) -> pd.DataFrame:
 def related_documents(sec, cik: int, accession: str, day: date) -> list[str]:
     """Press-release candidates the same filer filed on `day` or the day after: EX-99 exhibits of each
     filing, or the primary document of a 425, DEFA14A or SC14D9C (those are often the release itself)."""
-    df = _filings(sec, cik)
+    df = _filings(sec, cik, day)
     if df.empty:
         return []
     when = pd.to_datetime(df.filingDate).dt.date

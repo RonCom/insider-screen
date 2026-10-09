@@ -21,6 +21,7 @@ couldn't resolve get the reason and a search link. Check a few filled rows again
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 
 import duckdb
@@ -62,11 +63,13 @@ def sample(db: str, out: str, n: int = N, seed: int = 42, start: str = "2017-01-
 def fill(csv: str, sec=None, web=None) -> pd.DataFrame:
     """Fill press_release_et, press_release_source and notes for rows left blank. Saves after each row."""
     sec = sec or PoliteClient(cache_dir="data/cache/sec", user_agent=DEFAULT_USER_AGENT, max_per_second=5)
+    # newswires and search engines: give up fast on a blocked or hanging site (one retry, 15 s timeout)
     web = web or PoliteClient(cache_dir="data/cache/press", user_agent=press_release.BROWSER_UA,
-                              max_per_second=0.5)
+                              max_per_second=1.0, max_retries=1, timeout=15.0)
     df = pd.read_csv(csv, dtype=str, encoding="utf-8-sig").fillna("")
     todo = df.index[df.press_release_et.str.strip() == ""]
     print(f"{len(todo)} of {len(df)} rows to look up")
+    started = time.monotonic()
     for n, i in enumerate(todo, 1):
         try:
             accepted = df.at[i, "accepted_et"] if "accepted_et" in df else ""
@@ -77,7 +80,9 @@ def fill(csv: str, sec=None, web=None) -> pd.DataFrame:
         for k, v in found.items():
             df.at[i, k] = v
         df.to_csv(csv, index=False, encoding="utf-8-sig")
-        print(f"  {n}/{len(todo)} {df.at[i, 'company'][:40]}: {found['press_release_et'] or 'not found'}")
+        left = (time.monotonic() - started) / n * (len(todo) - n)
+        print(f"  {n}/{len(todo)} {df.at[i, 'company'][:40]}: {found['press_release_et'] or 'not found'}"
+              f"  (about {left / 60:.0f} min left)")
     done = (df.press_release_et.str.strip() != "").sum()
     print(f"{done} of {len(df)} rows have a press-release time; the rest have a note and a search link")
     return df

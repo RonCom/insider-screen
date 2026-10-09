@@ -163,3 +163,17 @@ def test_no_dateline_needs_close_title_and_filing_window():
     assert pr.find_release(sec, web, INDEX_URL, filed=date(2023, 11, 2))["press_release_et"] == "2023-11-02 06:00"
     got = pr.find_release(sec, web, INDEX_URL, filed=date(2023, 12, 1))
     assert got["press_release_et"] == "" and "filed 2023-12-01" in got["notes"]
+
+
+def test_only_submission_pages_covering_the_date_are_fetched():
+    import json
+    subs = {"filings": {"recent": {"accessionNumber": [], "filingDate": [], "form": [], "primaryDocument": []},
+                        "files": [{"name": "CIK0000000001-submissions-001.json", "filingFrom": "2019-01-01", "filingTo": "2021-12-31"},
+                                  {"name": "CIK0000000001-submissions-002.json", "filingFrom": "2001-01-01", "filingTo": "2018-12-31"}]}}
+    page = {"accessionNumber": ["0000000001-19-000001"], "filingDate": ["2019-06-10"], "form": ["425"],
+            "primaryDocument": ["a.htm"]}
+    sec = Fake({"https://data.sec.gov/submissions/CIK0000000001.json": json.dumps(subs),
+                "https://data.sec.gov/submissions/CIK0000000001-submissions-001.json": json.dumps(page)})
+    df = pr._filings(sec, 1, date(2019, 6, 10))
+    assert df.accessionNumber.tolist() == ["0000000001-19-000001"]
+    assert not any("submissions-002" in u for u in sec.urls)
