@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import time
 from pathlib import Path
 
@@ -40,7 +41,7 @@ import duckdb
 import httpx
 import pandas as pd
 
-from insider_screen.db import EDGAR, REFERENCE
+from insider_screen.db import EDGAR, FINRA, REFERENCE
 
 BASE_URLS = [os.environ.get("MASSIVE_API_URL", "https://api.massive.com"), "https://api.polygon.io"]
 PER_MINUTE = 5  # free plan
@@ -210,14 +211,41 @@ TICKER_ON_SQL = """
       ON t.cik = e.cik
      AND (t.valid_from IS NULL OR e.day0 >= t.valid_from)
      AND (t.valid_to IS NULL OR e.day0 <= t.valid_to)
-    QUALIFY row_number() OVER (PARTITION BY e.event_id ORDER BY t.type = 'CS' DESC, t.valid_to NULLS LAST) = 1
+    QUALIFY row_number() OVER (PARTITION BY e.event_id
+                               ORDER BY {volume} DESC, t.type = 'CS' DESC, t.valid_to NULLS LAST) = 1
 """
+# When a company has several tickers valid on day 0 (another share class, a when-issued or preferred line,
+# or an old and a new ticker with no start date known), the one that traded most in FINRA's files in day 0's
+# month and the month before is the company's stock on that date.
+VOLUME_SQL = """coalesce((SELECT sum(v.vol) FROM ticker_volume v WHERE v.symbol = t.ticker
+                          AND v.month BETWEEN date_trunc('month', e.day0) - INTERVAL 1 MONTH
+                                          AND date_trunc('month', e.day0)), 0)"""
+
+
+def ticker_on_sql(con: duckdb.DuckDBPyConnection, events: str, map: str = "ref.ticker_cik") -> str:
+    has_volume = con.execute("SELECT count(*) FROM duckdb_tables() WHERE table_name = 'ticker_volume'").fetchone()[0]
+    return TICKER_ON_SQL.format(events=events, map=map, volume=VOLUME_SQL if has_volume else "0")
+
+
+def attach(con: duckdb.DuckDBPyConnection, edgar_db: str = EDGAR, finra_db: str = FINRA) -> bool:
+    """Attach the EDGAR events read-only, and build ticker_volume (monthly FINRA volume per symbol) for
+    choosing between a company's tickers. Returns False, with a warning, if FINRA isn't available."""
+    con.execute(f"ATTACH '{Path(edgar_db).as_posix()}' AS edgar (READ_ONLY)")
+    try:
+        con.execute(f"ATTACH '{Path(finra_db).as_posix()}' AS finra (READ_ONLY)")
+        con.execute("""CREATE TEMP TABLE ticker_volume AS
+                       SELECT symbol, date_trunc('month', date) AS month, sum(total_volume) AS vol
+                       FROM finra.raw.finra_short_daily GROUP BY ALL""")
+        return True
+    except (duckdb.IOException, duckdb.CatalogException) as err:
+        print(f"Warning: no FINRA volume ({err}); a company's tickers are ranked without it")
+        return False
 
 
 def event_tickers_sql(con: duckdb.DuckDBPyConnection, events: str = "edgar.events.announcements") -> str:
     """SQL for events with their ticker on day 0: the map first, else the press-release supplement for
     that company and year (when the supplement table exists). Adds columns ticker and ticker_source."""
-    mapped = TICKER_ON_SQL.format(events=events, map="ref.ticker_cik")
+    mapped = ticker_on_sql(con, events)
     has_supp = con.execute("""SELECT count(*) FROM duckdb_tables()
                               WHERE schema_name = 'ref' AND table_name = 'ticker_supplement'""").fetchone()[0]
     if not has_supp:
@@ -230,10 +258,10 @@ def event_tickers_sql(con: duckdb.DuckDBPyConnection, events: str = "edgar.event
                  ON s.cik = m.cik AND s.year = year(m.day0) AND s.ticker IS NOT NULL AND NOT s.conflict"""
 
 
-def coverage(db: str = REFERENCE, edgar_db: str = EDGAR) -> pd.DataFrame:
+def coverage(db: str = REFERENCE, edgar_db: str = EDGAR, finra_db: str = FINRA) -> pd.DataFrame:
     """Share of events with a ticker valid on day 0, by event type and year."""
     con = duckdb.connect(db, read_only=True)
-    con.execute(f"ATTACH '{Path(edgar_db).as_posix()}' AS edgar (READ_ONLY)")
+    attach(con, edgar_db, finra_db)
     sql = event_tickers_sql(con)
     df = con.execute(f"""SELECT event_type, year(day0) AS year, count(*) AS events,
                                 count(ticker) AS with_ticker, round(count(ticker) / count(*), 3) AS share
@@ -269,6 +297,8 @@ def classify(map_ticker: str, release: str | None, cik: int, ranges: pd.DataFram
         return "no_ticker_in_release"
     if release == map_ticker:
         return "agree"
+    if re.fullmatch(re.escape(map_ticker) + r"[.\-]?(?:U|UN|W|WS|WT)", release):
+        return "units_or_warrants"  # a SPAC's release quotes its units; the map's common-share ticker is right
     holders = ranges[ranges.ticker == release]
     if holders.empty:
         return "release_ticker_not_in_map"
@@ -278,12 +308,12 @@ def classify(map_ticker: str, release: str | None, cik: int, ranges: pd.DataFram
 
 
 def check(db: str = REFERENCE, edgar_db: str = EDGAR, n: int = 200, seed: int = 7,
-          out: str = "data/ticker_check.csv", sec=None) -> pd.DataFrame:
+          out: str = "data/ticker_check.csv", sec=None, finra_db: str = FINRA) -> pd.DataFrame:
     """Compare the map's ticker with the press release's for n sampled events (n/3 per event type)."""
     sec = sec or _sec()
     con = duckdb.connect(db, read_only=True)
-    con.execute(f"ATTACH '{Path(edgar_db).as_posix()}' AS edgar (READ_ONLY)")
-    mapped = TICKER_ON_SQL.format(events="edgar.events.announcements", map="ref.ticker_cik")
+    attach(con, edgar_db, finra_db)
+    mapped = ticker_on_sql(con, "edgar.events.announcements")
     per_type = max(1, n // 3)
     sample = con.execute(f"""
         WITH m AS ({mapped})
@@ -305,7 +335,7 @@ def check(db: str = REFERENCE, edgar_db: str = EDGAR, n: int = 200, seed: int = 
     df = pd.concat([sample, pd.DataFrame(results)], axis=1)
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out, index=False, encoding="utf-8-sig")
-    comparable = df[df.outcome != "no_ticker_in_release"]
+    comparable = df[~df.outcome.isin(["no_ticker_in_release", "units_or_warrants"])]
     print("\n" + pd.crosstab(df.event_type, df.outcome, margins=True).to_string())
     if len(comparable):
         bad = comparable[comparable.outcome != "agree"]
@@ -317,15 +347,15 @@ def check(db: str = REFERENCE, edgar_db: str = EDGAR, n: int = 200, seed: int = 
 
 
 def fill(db: str = REFERENCE, edgar_db: str = EDGAR, types: list[str] | None = None, sec=None,
-         limit: int | None = None) -> None:
+         limit: int | None = None, finra_db: str = FINRA) -> None:
     """ref.ticker_supplement: a press-release ticker for each company-year that has events without one."""
     sec = sec or _sec()
     con = duckdb.connect(db)
     con.execute("CREATE SCHEMA IF NOT EXISTS ref")
     con.execute("""CREATE TABLE IF NOT EXISTS ref.ticker_supplement (
         cik BIGINT, year INTEGER, ticker VARCHAR, conflict BOOLEAN, accession VARCHAR, how VARCHAR)""")
-    con.execute(f"ATTACH '{Path(edgar_db).as_posix()}' AS edgar (READ_ONLY)")
-    mapped = TICKER_ON_SQL.format(events="edgar.events.announcements", map="ref.ticker_cik")
+    attach(con, edgar_db, finra_db)
+    mapped = ticker_on_sql(con, "edgar.events.announcements")
     type_filter = f"AND m.event_type IN ({', '.join(repr(t) for t in types)})" if types else ""
     # per company-year without a ticker: the latest event's 8-K first, then up to two more as fallbacks
     todo = con.execute(f"""

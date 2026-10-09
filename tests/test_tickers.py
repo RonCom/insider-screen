@@ -86,7 +86,7 @@ def test_coverage_joins_on_day0(tmp_path):
     con.close()
     con = duckdb.connect(db)
     con.execute(f"ATTACH '{edgar}' AS edgar (READ_ONLY)")
-    got = dict(con.execute(tk.TICKER_ON_SQL.format(events="edgar.events.announcements", map="ref.ticker_cik")
+    got = dict(con.execute(tk.ticker_on_sql(con, "edgar.events.announcements")
                            .replace("SELECT e.*, t.ticker", "SELECT e.event_id, t.ticker")).fetchall())
     con.close()
     assert got == {"e1": "SIX", "e2": "FB", "e3": "META", "e4": None}
@@ -114,7 +114,7 @@ def test_all_null_dates_still_typed(tmp_path):
                              "WHERE table_name = 'ticker_cik'").fetchall())
     assert types["valid_from"] == "DATE" and types["valid_to"] == "DATE"
     con.execute("CREATE TABLE ev AS SELECT 'e1' AS event_id, 1::BIGINT AS cik, TIMESTAMP '2023-01-05' AS day0")
-    assert con.execute(tk.TICKER_ON_SQL.format(events="ev", map="ref.ticker_cik")).fetchall()[0][-1] == "AAA"
+    assert con.execute(tk.ticker_on_sql(con, "ev")).fetchall()[0][-1] == "AAA"
 
 
 class FakeSec:
@@ -192,3 +192,52 @@ def test_fill_rejects_ticker_held_by_another_company(tmp_path):
     con = duckdb.connect(db)
     row = con.execute("SELECT ticker, conflict, how FROM ref.ticker_supplement").fetchone()
     assert row[:2] == ("CELG", True) and "Celgene" in row[2]
+
+
+def test_finra_volume_picks_the_traded_ticker(tmp_path):
+    """Several tickers valid for one company on day 0: the one that traded most that month wins."""
+    db, edgar, finra = (str(tmp_path / f) for f in ("reference.duckdb", "edgar.duckdb", "finra.duckdb"))
+    con = duckdb.connect(db)
+    con.execute("CREATE SCHEMA ref")
+    con.execute("""CREATE TABLE ref.ticker_cik AS SELECT * FROM (VALUES
+        ('VRNT', 1166388, 'CS', NULL::DATE), ('VRNTV', 1166388, 'CS', DATE '2016-06-01'),
+        ('FB', 1326801, 'CS', DATE '2022-06-09'), ('META', 1326801, 'CS', NULL::DATE),
+        ('SOI', 1697500, 'CS', DATE '2024-07-31'), ('SEI', 1697500, 'CS', NULL::DATE)
+        ) t(ticker, cik, type, valid_to)""")
+    con.execute("ALTER TABLE ref.ticker_cik ADD COLUMN valid_from DATE")
+    con.close()
+    con = duckdb.connect(edgar)
+    con.execute("CREATE SCHEMA events")
+    con.execute("""CREATE TABLE events.announcements AS SELECT * FROM (VALUES
+        ('verint', 1166388, TIMESTAMP '2016-03-29'), ('meta21', 1326801, TIMESTAMP '2021-07-28'),
+        ('meta23', 1326801, TIMESTAMP '2023-07-26'), ('solaris', 1697500, TIMESTAMP '2024-07-10'))
+        t(event_id, cik, day0)""")
+    con.close()
+    con = duckdb.connect(finra)
+    con.execute("CREATE SCHEMA raw")
+    con.execute("""CREATE TABLE raw.finra_short_daily AS SELECT * FROM (VALUES
+        (DATE '2016-03-15', 'VRNT', 900000), (DATE '2016-03-15', 'VRNTV', 2000),
+        (DATE '2021-07-15', 'FB', 5000000), (DATE '2023-07-14', 'META', 6000000),
+        (DATE '2024-07-09', 'SOI', 300000)) t(date, symbol, total_volume)""")
+    con.close()
+    con = duckdb.connect(db, read_only=True)
+    assert tk.attach(con, edgar, finra)
+    sql = tk.ticker_on_sql(con, "edgar.events.announcements").replace("SELECT e.*, t.ticker", "SELECT e.event_id, t.ticker")
+    got = dict(con.execute(sql).fetchall())
+    con.close()
+    assert got == {"verint": "VRNT", "meta21": "FB", "meta23": "META", "solaris": "SOI"}
+
+
+def test_units_are_not_errors():
+    ranges = pd.DataFrame({"ticker": ["PHYT"], "cik": [1]})
+    assert tk.classify("PHYT", "PHYT.U", 1, ranges) == "units_or_warrants"
+    assert tk.classify("ASAX", "ASAXU", 1, ranges) == "units_or_warrants"
+    assert tk.classify("ASAX", "ASAXX", 1, ranges) == "release_ticker_not_in_map"
+
+
+def test_attach_without_finra_warns(tmp_path, capsys):
+    con = duckdb.connect()
+    edgar = str(tmp_path / "e.duckdb")
+    duckdb.connect(edgar).close()
+    assert tk.attach(con, edgar, str(tmp_path / "missing.duckdb")) is False
+    assert "no FINRA volume" in capsys.readouterr().out
