@@ -44,16 +44,22 @@ TICKER_RE = re.compile(
 
 def ticker_from_text(text: str, company: str) -> tuple[str | None, str]:
     """The ticker given in a press release for `company`. Each "(EXCHANGE: TICKER)" is scored by how well
-    the 150 characters before it match the company's name; returns (ticker, how it was chosen)."""
+    the 150 characters before it match the company's name; returns (ticker, how it was chosen).
+    `company` may hold several names joined by "|" (current and former EDGAR names): EDGAR shows today's
+    name, and a release from before a rename (Westar Energy, now Evergy Kansas Central) uses the old one."""
     hits = [(m.group(1).upper(), text[max(0, m.start() - 150):m.start()]) for m in TICKER_RE.finditer(text[:8000])]
+    names = [n for n in (normalize(x) for x in company.split("|")) if n]
+    shown = company.split("|")[0]
     if not hits:
         return None, "no ticker in the press release"
-    name = normalize(company)
-    scored = sorted(((fuzz.partial_ratio(name, normalize(before)), t) for t, before in hits), reverse=True)
+    if not names:
+        return None, f"tickers {sorted({t for t, _ in hits})} but no company name to match"
+    scored = sorted(((max(fuzz.partial_ratio(n, normalize(before)) for n in names), t) for t, before in hits),
+                    reverse=True)
     best, ticker = scored[0]
     if best >= 80:
         return ticker, f"ticker next to the company name (match {best:.0f})"
-    return None, f"tickers {sorted({t for t, _ in hits})} but none next to '{company}'"
+    return None, f"tickers {sorted({t for t, _ in hits})} but none next to '{shown}'"
 
 
 def fetch_minutes(api: Alpaca, symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:

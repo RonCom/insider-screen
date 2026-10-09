@@ -312,3 +312,47 @@ def test_release_ticker_gets_a_date(monkeypatch):
     tk._release_ticker(None, 1, "0001-18-000004", "Gone Corp", datetime(2018, 5, 1))
     tk._release_ticker(None, 1, "0001-18-000004", "Gone Corp", pd.NaT)
     assert seen == [date(2018, 5, 1), None] and type(seen[0]) is date
+
+
+def test_ticker_next_to_former_name():
+    from insider_screen.market_move import ticker_from_text
+    text = "Great Plains Energy (NYSE: GXP) and Westar Energy, Inc. (NYSE: WR) today announced"
+    assert ticker_from_text(text, "EVERGY KANSAS CENTRAL, INC.")[0] is None
+    assert ticker_from_text(text, "EVERGY KANSAS CENTRAL, INC.|WESTAR ENERGY INC /KS")[0] == "WR"
+
+
+def test_names_fills_from_map_rows_without_cik(tmp_path):
+    db, edgar = str(tmp_path / "reference.duckdb"), str(tmp_path / "edgar.duckdb")
+    con = duckdb.connect(db)
+    con.execute("CREATE SCHEMA ref")
+    con.execute("""CREATE TABLE ref.ticker_cik AS SELECT ticker, cik::BIGINT AS cik, name, 'CS' AS type, valid_from::DATE AS valid_from,
+                   valid_to::DATE AS valid_to FROM (VALUES
+        ('CEB', NULL, 'CEB Inc. Common Stock', NULL, '2017-04-05'),
+        ('LIME', NULL, 'Lime Energy Co.', NULL, '2016-01-01'),      -- delisted before day 0
+        ('DUP1', NULL, 'Twin Corp', NULL, NULL), ('DUP2', NULL, 'Twin Corp', NULL, NULL),  -- ambiguous
+        ('STR', NULL, 'Questar Corp', NULL, '2016-09-16'),
+        ('META', 1326801, 'Meta Platforms', NULL, NULL)) t(ticker, cik, name, valid_from, valid_to)""")
+    con.execute("""CREATE TABLE ref.ticker_supplement AS SELECT * FROM (VALUES
+        (751652::BIGINT, 2016, NULL::VARCHAR, FALSE, 'a', 'no ticker in the press release'))
+        t(cik, year, ticker, conflict, accession, how)""")
+    con.close()
+    con = duckdb.connect(edgar)
+    con.execute("CREATE SCHEMA events; CREATE SCHEMA raw")
+    con.execute("""CREATE TABLE raw.edgar_companies AS SELECT * FROM (VALUES
+        (1066104, 'CEB Inc.', ''), (1065860, 'LIME ENERGY CO.', ''), (7, 'Twin Corp', ''),
+        (751652, 'DOMINION QUESTAR CORP', 'QUESTAR CORP'), (1326801, 'Meta Platforms, Inc.', 'FACEBOOK INC'))
+        t(cik, name, former_names)""")
+    con.execute("""CREATE TABLE events.announcements AS SELECT * FROM (VALUES
+        ('e1', 1066104, 'acquisition_target', TIMESTAMP '2017-01-05'),
+        ('e2', 1065860, 'acquisition_target', TIMESTAMP '2016-06-01'),
+        ('e3', 7, 'earnings', TIMESTAMP '2018-05-01'),
+        ('e4', 751652, 'acquisition_target', TIMESTAMP '2016-02-01'),
+        ('e5', 1326801, 'earnings', TIMESTAMP '2021-07-28')) t(event_id, cik, event_type, day0)""")
+    con.close()
+    out = tk.names(db, edgar)
+    assert sorted(zip(out.cik, out.ticker)) == [(751652, "STR"), (1066104, "CEB")]
+    con = duckdb.connect(db)
+    assert con.execute("SELECT count(*) FROM ref.ticker_supplement WHERE cik = 751652").fetchone()[0] == 1
+    con.execute(f"ATTACH '{edgar}' AS edgar (READ_ONLY)")
+    got = dict(con.execute(f"SELECT event_id, ticker FROM ({tk.event_tickers_sql(con)})").fetchall())
+    assert got == {"e1": "CEB", "e2": None, "e3": None, "e4": "STR", "e5": "META"}

@@ -285,6 +285,74 @@ def coverage(db: str = REFERENCE, edgar_db: str = EDGAR, finra_db: str = FINRA) 
     return df
 
 
+def _names_sql(con, alias: str = "c") -> str:
+    """Current and former EDGAR names joined by "|" (former_names is missing from older edgar files)."""
+    has = con.execute("""SELECT count(*) FROM duckdb_columns() WHERE database_name = 'edgar'
+                         AND table_name = 'edgar_companies' AND column_name = 'former_names'""").fetchone()[0]
+    if not has:
+        return f"{alias}.name"
+    return f"{alias}.name || CASE WHEN coalesce({alias}.former_names, '') <> '' THEN '|' || {alias}.former_names ELSE '' END"
+
+
+_SECURITY_TAIL_RE = re.compile(r"\b(?:class [a-z] )?(?:common|ordinary|capital) (?:stock|shares)\b.*$|\badrs?\b.*$", re.I)
+
+
+def _name_key(name: str | None) -> str:
+    from insider_screen.match import normalize
+    return normalize(_SECURITY_TAIL_RE.sub("", name or ""))
+
+
+def names(db: str = REFERENCE, edgar_db: str = EDGAR, finra_db: str = FINRA) -> pd.DataFrame:
+    """ref.ticker_supplement rows from names, no network: for each company-year still without a ticker,
+    a map row with no CIK whose name equals the company's current or former EDGAR name (after
+    normalizing) and whose dates cover the last day 0. Massive leaves the CIK off many delisted
+    tickers, so these companies drop out of the CIK join. Taken only when exactly one ticker
+    matches and no other company holds it that day."""
+    con = duckdb.connect(db)
+    con.execute("CREATE SCHEMA IF NOT EXISTS ref")
+    con.execute("""CREATE TABLE IF NOT EXISTS ref.ticker_supplement (
+        cik BIGINT, year INTEGER, ticker VARCHAR, conflict BOOLEAN, accession VARCHAR, how VARCHAR)""")
+    attach(con, edgar_db, finra_db)
+    mapped = ticker_on_sql(con, "edgar.events.announcements")
+    todo = con.execute(f"""
+        WITH m AS ({mapped})
+        SELECT m.cik, year(m.day0) AS year, {_names_sql(con)} AS names, CAST(max(m.day0) AS DATE) AS last_day0
+        FROM m JOIN edgar.raw.edgar_companies c USING (cik)
+        WHERE m.ticker IS NULL
+          AND NOT EXISTS (SELECT 1 FROM ref.ticker_supplement s
+                          WHERE s.cik = m.cik AND s.year = year(m.day0) AND s.ticker IS NOT NULL)
+        GROUP BY 1, 2, 3""").df()
+    cands = con.execute("SELECT ticker, name, valid_from, valid_to FROM ref.ticker_cik WHERE cik IS NULL").df()
+    by_name: dict[str, list] = {}
+    for r in cands.itertuples(index=False):
+        key = _name_key(r.name)
+        if key:
+            by_name.setdefault(key, []).append(r)
+    rows = []
+    for r in todo.itertuples(index=False):
+        day = r.last_day0
+        hits = {c.ticker: c.name for key in {_name_key(n) for n in r.names.split("|")} if key
+                for c in by_name.get(key, [])
+                if (pd.isna(c.valid_from) or c.valid_from <= day) and (pd.isna(c.valid_to) or c.valid_to >= day)}
+        if len(hits) != 1:
+            continue
+        (ticker, mname), = hits.items()
+        other = con.execute(
+            """SELECT name FROM ref.ticker_cik WHERE ticker = ? AND cik IS NOT NULL AND cik <> ?
+               AND (valid_from IS NULL OR valid_from <= ?) AND (valid_to IS NULL OR valid_to >= ?)""",
+            [ticker, int(r.cik), day, day]).fetchone()
+        if other:
+            continue
+        rows.append((int(r.cik), int(r.year), ticker, False, None, f"name match: '{mname}' in the map has no CIK"))
+    for cik, year, *_ in rows:
+        con.execute("DELETE FROM ref.ticker_supplement WHERE cik = ? AND year = ?", [cik, year])
+    if rows:
+        con.executemany("INSERT INTO ref.ticker_supplement VALUES (?, ?, ?, ?, ?, ?)", rows)
+    con.close()
+    print(f"{len(todo)} company-years without a ticker; {len(rows)} matched by name to a map row without a CIK")
+    return pd.DataFrame(rows, columns=["cik", "year", "ticker", "conflict", "accession", "how"])
+
+
 def _sec():
     from insider_screen.http import DEFAULT_USER_AGENT, PoliteClient
     return PoliteClient(cache_dir="data/cache/sec", user_agent=DEFAULT_USER_AGENT, max_per_second=5)
@@ -379,7 +447,8 @@ def fill(db: str = REFERENCE, edgar_db: str = EDGAR, types: list[str] | None = N
     # per company-year without a ticker: the latest event's 8-K first, then up to two more as fallbacks
     todo = con.execute(f"""
         WITH m AS ({mapped})
-        SELECT m.cik, year(m.day0) AS year, c.name AS company, list(m.accession ORDER BY m.day0 DESC)[1:3] AS accessions,
+        SELECT m.cik, year(m.day0) AS year, {_names_sql(con)} AS company,
+               list(m.accession ORDER BY m.day0 DESC)[1:3] AS accessions,
                list(CAST(m.accepted_et AS DATE) ORDER BY m.day0 DESC)[1:3] AS filed, max(m.day0) AS last_day0
         FROM m JOIN edgar.raw.edgar_companies c USING (cik)
         WHERE m.ticker IS NULL {type_filter}
@@ -434,6 +503,9 @@ def main() -> None:
     f.add_argument("--types", nargs="*", help="event types, e.g. acquisition_target earnings")
     f.add_argument("--limit", type=int)
     f.add_argument("--retry", action="store_true", help="look again at company-years that had no ticker")
+    n = sub.add_parser("names", help="match company-years without a ticker to map rows that have no CIK")
+    n.add_argument("--db", default=REFERENCE)
+    n.add_argument("--edgar-db", default=EDGAR)
     a = ap.parse_args()
     if a.cmd == "download":
         key = os.environ.get("MASSIVE_API_KEY")
@@ -446,6 +518,8 @@ def main() -> None:
         check(a.db, a.edgar_db, a.n, out=a.out)
     elif a.cmd == "fill":
         fill(a.db, a.edgar_db, a.types, limit=a.limit, retry=a.retry)
+    elif a.cmd == "names":
+        names(a.db, a.edgar_db)
     else:
         coverage(a.db, a.edgar_db)
 
