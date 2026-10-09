@@ -10,17 +10,24 @@ in the extraction table.
 import duckdb
 
 from insider_screen.db import EDGAR, RELEASES
-from insider_screen.extract import TABLE
-
 con = duckdb.connect(RELEASES, read_only=True)
 con.execute(f"ATTACH '{EDGAR}' AS edgar (READ_ONLY)")
+# every extraction version: each release takes its newest version that has it
+tables = [r[0] for r in con.execute("""SELECT table_name FROM duckdb_tables() WHERE schema_name = 'extracted'
+                                        AND table_name LIKE 'traded_events_v%' ORDER BY 1""").fetchall()]
+for t in tables:
+    n, k = con.execute(f"SELECT count(*), count(DISTINCT lr_no) FROM extracted.{t}").fetchone()
+    print(f"extracted.{t}: {n} rows, {k} releases")
+TABLE = "(" + " UNION ALL BY NAME ".join(
+    f"SELECT *, {int(t.rsplit('_v', 1)[1])} AS version FROM extracted.{t}" for t in tables) + ")"
+TABLE = f"(SELECT * FROM {TABLE} QUALIFY version = max(version) OVER (PARTITION BY lr_no))"
 df = con.execute(f"""
     WITH ch AS (
         SELECT e.event_id, e.cik, CAST(e.day0 AS DATE) AS day0,
                CAST(unnest(string_split(e.lr_numbers, '|')) AS INTEGER) AS lr_no
         FROM labels.charged_events e JOIN edgar.events.target_audit a USING (event_id)
         WHERE e.is_charged AND a.in_target_set)
-    SELECT DISTINCT co.name, ch.day0, ch.lr_no, t.issuer_name, t.event_type, t.instruments, t.direction
+    SELECT DISTINCT co.name, ch.day0, ch.lr_no, t.version, t.issuer_name, t.event_type, t.instruments, t.direction
     FROM ch JOIN edgar.raw.edgar_companies co USING (cik)
     LEFT JOIN {TABLE} t USING (lr_no)
     ORDER BY ch.day0, ch.lr_no""").df()
