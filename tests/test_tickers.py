@@ -356,3 +356,27 @@ def test_names_fills_from_map_rows_without_cik(tmp_path):
     con.execute(f"ATTACH '{edgar}' AS edgar (READ_ONLY)")
     got = dict(con.execute(f"SELECT event_id, ticker FROM ({tk.event_tickers_sql(con)})").fetchall())
     assert got == {"e1": "CEB", "e2": None, "e3": None, "e4": "STR", "e5": "META"}
+
+
+def test_names_accepts_a_map_cik_edgar_does_not_contradict(tmp_path):
+    db, edgar = str(tmp_path / "reference.duckdb"), str(tmp_path / "edgar.duckdb")
+    con = duckdb.connect(db)
+    con.execute("CREATE SCHEMA ref")
+    con.execute("""CREATE TABLE ref.ticker_cik AS SELECT ticker, cik::BIGINT AS cik, name, 'CS' AS type,
+                   valid_from::DATE AS valid_from, valid_to::DATE AS valid_to FROM (VALUES
+        ('VSR', 1541910, 'Versar, Inc.', NULL, '2017-09-26'),       -- CIK EDGAR doesn't know
+        ('ACME', 42, 'Acme Corp', NULL, NULL)) t(ticker, cik, name, valid_from, valid_to)""")
+    con.close()
+    con = duckdb.connect(edgar)
+    con.execute("CREATE SCHEMA events; CREATE SCHEMA raw")
+    con.execute("""CREATE TABLE raw.edgar_companies AS SELECT * FROM (VALUES
+        (803647, 'VERSAR INC', ''), (9, 'ACME CORP', ''), (42, 'Acme Industries Holdings', 'Roadrunner Inc'))
+        t(cik, name, former_names)""")
+    con.execute("""CREATE TABLE events.announcements AS SELECT * FROM (VALUES
+        ('e1', 803647, 'acquisition_target', TIMESTAMP '2017-08-01'),
+        ('e2', 803647, 'other_material_candidate', TIMESTAMP '2017-11-01'),
+        ('e3', 9, 'earnings', TIMESTAMP '2018-05-01')) t(event_id, cik, event_type, day0)""")
+    con.close()
+    out = tk.names(db, edgar)
+    # VSR: valid on the August event though delisted before November; ACME belongs to CIK 42, named otherwise
+    assert list(zip(out.cik, out.ticker)) == [(803647, "VSR")] and "1541910" in out.how[0]

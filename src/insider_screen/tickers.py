@@ -304,10 +304,10 @@ def _name_key(name: str | None) -> str:
 
 def names(db: str = REFERENCE, edgar_db: str = EDGAR, finra_db: str = FINRA) -> pd.DataFrame:
     """ref.ticker_supplement rows from names, no network: for each company-year still without a ticker,
-    a map row with no CIK whose name equals the company's current or former EDGAR name (after
-    normalizing) and whose dates cover the last day 0. Massive leaves the CIK off many delisted
-    tickers, so these companies drop out of the CIK join. Taken only when exactly one ticker
-    matches and no other company holds it that day."""
+    a map row whose name equals the company's current or former EDGAR name (after normalizing) and whose
+    dates overlap the year's events. The map row may have no CIK (Massive leaves it off many delisted
+    tickers) or a CIK that EDGAR doesn't know or knows under the same name (Versar's VSR carries
+    another CIK). Taken only when exactly one ticker matches and no differently named company holds it."""
     con = duckdb.connect(db)
     con.execute("CREATE SCHEMA IF NOT EXISTS ref")
     con.execute("""CREATE TABLE IF NOT EXISTS ref.ticker_supplement (
@@ -316,40 +316,54 @@ def names(db: str = REFERENCE, edgar_db: str = EDGAR, finra_db: str = FINRA) -> 
     mapped = ticker_on_sql(con, "edgar.events.announcements")
     todo = con.execute(f"""
         WITH m AS ({mapped})
-        SELECT m.cik, year(m.day0) AS year, {_names_sql(con)} AS names, CAST(max(m.day0) AS DATE) AS last_day0
+        SELECT m.cik, year(m.day0) AS year, {_names_sql(con)} AS names,
+               CAST(min(m.day0) AS DATE) AS first_day0, CAST(max(m.day0) AS DATE) AS last_day0
         FROM m JOIN edgar.raw.edgar_companies c USING (cik)
         WHERE m.ticker IS NULL
           AND NOT EXISTS (SELECT 1 FROM ref.ticker_supplement s
                           WHERE s.cik = m.cik AND s.year = year(m.day0) AND s.ticker IS NOT NULL)
         GROUP BY 1, 2, 3""").df()
-    cands = con.execute("SELECT ticker, name, valid_from, valid_to FROM ref.ticker_cik WHERE cik IS NULL").df()
+    edgar_keys = {int(cik): {_name_key(n) for n in str(ns).split("|")} for cik, ns in con.execute(
+        f"SELECT c.cik, {_names_sql(con)} FROM edgar.raw.edgar_companies c").fetchall()}
+    cands = con.execute("SELECT ticker, cik, name, valid_from, valid_to FROM ref.ticker_cik").df()
     by_name: dict[str, list] = {}
     for r in cands.itertuples(index=False):
         key = _name_key(r.name)
         if key:
             by_name.setdefault(key, []).append(r)
+
+    def same_company(cik, key) -> bool:  # a map CIK EDGAR doesn't know, or knows under this name
+        return pd.isna(cik) or int(cik) not in edgar_keys or key in edgar_keys[int(cik)]
+
     rows = []
     for r in todo.itertuples(index=False):
-        day = r.last_day0
-        hits = {c.ticker: c.name for key in {_name_key(n) for n in r.names.split("|")} if key
-                for c in by_name.get(key, [])
-                if (pd.isna(c.valid_from) or c.valid_from <= day) and (pd.isna(c.valid_to) or c.valid_to >= day)}
+        lo, hi = r.first_day0, r.last_day0
+        hits = {}
+        for key in {_name_key(n) for n in r.names.split("|")} - {""}:
+            for c in by_name.get(key, []):
+                if not pd.isna(c.cik) and int(c.cik) == int(r.cik):
+                    continue  # the CIK join already had this row; its dates don't fit
+                if not same_company(c.cik, key):
+                    continue
+                if (pd.isna(c.valid_from) or c.valid_from <= hi) and (pd.isna(c.valid_to) or c.valid_to >= lo):
+                    hits[c.ticker] = (c.name, c.cik)
         if len(hits) != 1:
             continue
-        (ticker, mname), = hits.items()
-        other = con.execute(
-            """SELECT name FROM ref.ticker_cik WHERE ticker = ? AND cik IS NOT NULL AND cik <> ?
-               AND (valid_from IS NULL OR valid_from <= ?) AND (valid_to IS NULL OR valid_to >= ?)""",
-            [ticker, int(r.cik), day, day]).fetchone()
-        if other:
+        (ticker, (mname, mcik)), = hits.items()
+        holders = cands[(cands.ticker == ticker) & cands.cik.notna()
+                        & (cands.valid_from.isna() | (cands.valid_from <= hi))
+                        & (cands.valid_to.isna() | (cands.valid_to >= lo))]
+        if any(int(h) != int(r.cik) and not same_company(h, _name_key(mname)) for h in holders.cik):
             continue
-        rows.append((int(r.cik), int(r.year), ticker, False, None, f"name match: '{mname}' in the map has no CIK"))
+        how = (f"name match: '{mname}' in the map has no CIK" if pd.isna(mcik)
+               else f"name match: '{mname}' in the map under CIK {int(mcik)}")
+        rows.append((int(r.cik), int(r.year), ticker, False, None, how))
     for cik, year, *_ in rows:
         con.execute("DELETE FROM ref.ticker_supplement WHERE cik = ? AND year = ?", [cik, year])
     if rows:
         con.executemany("INSERT INTO ref.ticker_supplement VALUES (?, ?, ?, ?, ?, ?)", rows)
     con.close()
-    print(f"{len(todo)} company-years without a ticker; {len(rows)} matched by name to a map row without a CIK")
+    print(f"{len(todo)} company-years without a ticker; {len(rows)} matched by name to a map row")
     return pd.DataFrame(rows, columns=["cik", "year", "ticker", "conflict", "accession", "how"])
 
 
@@ -428,6 +442,9 @@ def check(db: str = REFERENCE, edgar_db: str = EDGAR, n: int = 200, seed: int = 
     return df
 
 
+PRIORITY = "CASE m.event_type WHEN 'earnings' THEN 0 WHEN 'acquisition_target' THEN 1 ELSE 2 END"
+
+
 def fill(db: str = REFERENCE, edgar_db: str = EDGAR, types: list[str] | None = None, sec=None,
          limit: int | None = None, finra_db: str = FINRA, retry: bool = False) -> None:
     """ref.ticker_supplement: a press-release ticker for each company-year that has events without one.
@@ -443,17 +460,20 @@ def fill(db: str = REFERENCE, edgar_db: str = EDGAR, types: list[str] | None = N
         print(f"Retrying {n} company-years that had no ticker")
     attach(con, edgar_db, finra_db)
     mapped = ticker_on_sql(con, "edgar.events.announcements")
-    type_filter = f"AND m.event_type IN ({', '.join(repr(t) for t in types)})" if types else ""
-    # per company-year without a ticker: the latest event's 8-K first, then up to two more as fallbacks
+    # --types picks company-years with such an event; every event's 8-K that year is a candidate
+    type_filter = f"HAVING bool_or(m.event_type IN ({', '.join(repr(t) for t in types)}))" if types else ""
+    # per company-year without a ticker: up to four 8-Ks, earnings first (their releases nearly always
+    # quote the ticker), then deal announcements, then the rest; latest first within each
     todo = con.execute(f"""
         WITH m AS ({mapped})
         SELECT m.cik, year(m.day0) AS year, {_names_sql(con)} AS company,
-               list(m.accession ORDER BY m.day0 DESC)[1:3] AS accessions,
-               list(CAST(m.accepted_et AS DATE) ORDER BY m.day0 DESC)[1:3] AS filed, max(m.day0) AS last_day0
+               list(m.accession ORDER BY {PRIORITY}, m.day0 DESC)[1:4] AS accessions,
+               list(CAST(m.accepted_et AS DATE) ORDER BY {PRIORITY}, m.day0 DESC)[1:4] AS filed,
+               max(m.day0) AS last_day0
         FROM m JOIN edgar.raw.edgar_companies c USING (cik)
-        WHERE m.ticker IS NULL {type_filter}
+        WHERE m.ticker IS NULL
           AND NOT EXISTS (SELECT 1 FROM ref.ticker_supplement s WHERE s.cik = m.cik AND s.year = year(m.day0))
-        GROUP BY 1, 2, 3 ORDER BY 2, 1""").df()
+        GROUP BY 1, 2, 3 {type_filter} ORDER BY 2, 1""").df()
     if limit:
         todo = todo.head(limit)
     print(f"{len(todo)} company-years to look up")
