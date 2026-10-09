@@ -106,7 +106,7 @@ def test_all_null_dates_still_typed(tmp_path):
     db = str(tmp_path / "reference.duckdb")
     con = duckdb.connect(db)
     tk._setup(con)
-    con.execute("INSERT INTO raw.massive_tickers VALUES ('AAA', '0000000001', 'A', 'CS', TRUE, 'XNYS', NULL, NULL, NULL, NULL, now())")
+    con.execute("INSERT INTO raw.massive_tickers VALUES ('AAA', 'A', '0000000001', 'CS', TRUE, 'XNYS', NULL, NULL, NULL, NULL, now())")
     con.close()
     tk.build(db)
     con = duckdb.connect(db)
