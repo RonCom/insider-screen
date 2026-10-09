@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -42,7 +43,7 @@ MARKET_CLOSE = time(16, 0)
 @dataclass
 class Day0:
     day0: date
-    basis: str  # late_8k_shift | 8k_confirmed | 8k_no_move | 8k_no_data
+    basis: str  # late_8k_shift | 8k_confirmed | 8k_no_move | 8k_no_data | no_ticker
     shift: int  # sessions moved earlier (0 or 1)
     note: str
     prior_moves: list[date] = field(default_factory=list)  # announcement-sized moves before day 0, not used
@@ -106,3 +107,97 @@ def daily_frame(bars: pd.DataFrame, ticker: str) -> pd.DataFrame:
     stock = bars[bars.symbol == ticker].set_index("date")[["close", "volume"]]
     spy = bars[bars.symbol == "SPY"].set_index("date")[["close"]].rename(columns={"close": "spy_close"})
     return stock.join(spy, how="inner").sort_index()
+
+
+SPOT_CHECK_N = 20
+
+
+def apply(reference_db: str, edgar_db: str, prices_db: str, finra_db: str,
+          sample_out: str = "data/day0_shift_check.csv", dev_csv: str = "data/day0_check.csv",
+          n: int = SPOT_CHECK_N, seed: int = 11) -> pd.DataFrame:
+    """Run the rule on every acquisition target with a ticker, from the local daily bars (all
+    adjustments), and write events.target_day0 to the EDGAR file. Then draw `n` shifted events that
+    weren't in the development sample for the spot check, to `sample_out`."""
+    import duckdb
+
+    from insider_screen import tickers
+    from insider_screen.press_release import INDEX_URL
+
+    con = duckdb.connect(reference_db, read_only=True)
+    tickers.attach(con, edgar_db, finra_db)
+    events = con.execute(f"""
+        SELECT e.event_id, e.cik, c.name AS company, e.accession, e.accepted_et, CAST(e.day0 AS DATE) AS day0_8k,
+               e.ticker, e.ticker_source
+        FROM ({tickers.event_tickers_sql(con)}) e JOIN edgar.raw.edgar_companies c USING (cik)
+        WHERE e.event_type = 'acquisition_target'""").df()
+    con.close()
+    with_ticker = events[events.ticker.notna()]
+    con = duckdb.connect(prices_db, read_only=True)
+    con.register("syms", pd.DataFrame({"symbol": sorted(set(with_ticker.ticker) | {"SPY"})}))
+    bars = con.execute("""SELECT b.symbol, b.date, b.close, b.volume FROM raw.alpaca_bars_daily b
+                          JOIN syms USING (symbol) WHERE b.adjustment = 'all' ORDER BY b.symbol, b.date""").df()
+    con.close()
+    bars["date"] = pd.to_datetime(bars.date).dt.date
+    spy = bars[bars.symbol == "SPY"].set_index("date")[["close"]].rename(columns={"close": "spy_close"})
+    by_symbol = {s: g.set_index("date")[["close", "volume"]] for s, g in bars.groupby("symbol")}
+
+    rows = []
+    for e in events.itertuples(index=False):
+        s = pd.Timestamp(e.day0_8k).date()
+        if e.ticker is None or pd.isna(e.ticker):
+            res = Day0(s, "no_ticker", 0, "no ticker for the company on day 0")
+        elif e.ticker not in by_symbol:
+            res = Day0(s, "8k_no_data", 0, f"no daily bars for {e.ticker}")
+        else:
+            d = by_symbol[e.ticker].join(spy, how="inner").sort_index()
+            d = d[d.index <= s]
+            accepted = pd.Timestamp(e.accepted_et) if not pd.isna(e.accepted_et) else None
+            res = choose_day0(d, s, accepted)
+        rows.append({"event_id": e.event_id, "ticker": e.ticker, "ticker_source": e.ticker_source,
+                     "day0_8k": s, "day0": res.day0, "basis": res.basis, "shift": res.shift, "note": res.note,
+                     "prior_moves": "|".join(map(str, res.prior_moves))})
+    out = pd.DataFrame(rows)
+    con = duckdb.connect(edgar_db)
+    con.execute("CREATE SCHEMA IF NOT EXISTS events")
+    con.register("out", out)
+    con.execute("CREATE OR REPLACE TABLE events.target_day0 AS SELECT * FROM out")
+    con.close()
+
+    print(f"{len(out)} acquisition targets:")
+    print(out.basis.value_counts().to_string())
+    print(f"{(out.prior_moves != '').sum()} with announcement-sized moves before day 0, kept in the window")
+
+    dev = set()
+    if Path(dev_csv).exists():
+        dev = set(pd.read_csv(dev_csv, dtype=str).get("event_id", pd.Series(dtype=str)))
+    shifted = out[(out.basis == "late_8k_shift") & ~out.event_id.isin(dev)].merge(
+        events[["event_id", "company", "cik", "accession", "accepted_et"]], on="event_id")
+    pick = shifted.sample(n=min(n, len(shifted)), random_state=seed).copy()
+    pick["filing_index"] = [INDEX_URL.format(cik=int(c), folder=a.replace("-", ""), acc=a)
+                            for c, a in zip(pick.cik, pick.accession)]
+    pick["release_date"] = ""
+    pick["verdict"] = ""
+    pick["notes"] = ""
+    cols = ["event_id", "company", "ticker", "accepted_et", "day0_8k", "day0", "note", "filing_index",
+            "release_date", "verdict", "notes"]
+    Path(sample_out).parent.mkdir(parents=True, exist_ok=True)
+    pick[cols].to_csv(sample_out, index=False, encoding="utf-8-sig")
+    print(f"\nSpot check: {len(pick)} of {len(shifted)} shifted events (not in the development sample) -> "
+          f"{sample_out}")
+    return out
+
+
+def main() -> None:
+    import argparse
+
+    from insider_screen.db import EDGAR, FINRA, PRICES, REFERENCE
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    a = sub.add_parser("apply", help="day 0 for every acquisition target, plus the shift spot-check sample")
+    a.add_argument("--n", type=int, default=SPOT_CHECK_N)
+    args = ap.parse_args()
+    apply(REFERENCE, EDGAR, PRICES, FINRA, n=args.n)
+
+
+if __name__ == "__main__":
+    main()

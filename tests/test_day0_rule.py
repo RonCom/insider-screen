@@ -179,3 +179,39 @@ def test_heavy_volume_path_keeps_its_limits():
     noisy[-2] = 0.07 + f.spy_close.pct_change().iloc[-2]
     f["close"] = 20 * np.cumprod(np.nan_to_num(1 + noisy, nan=1.0))
     assert r.choose_day0(f, S, at(SESS[-2], "17:00")).basis == "8k_no_move"
+
+
+def test_apply_writes_target_day0_and_spot_check(tmp_path):
+    import duckdb
+    ref, edgar, prices, finra = (str(tmp_path / f) for f in
+                                 ("reference.duckdb", "edgar.duckdb", "prices.duckdb", "finra.duckdb"))
+    con = duckdb.connect(ref)
+    con.execute("CREATE SCHEMA ref")
+    con.execute("""CREATE TABLE ref.ticker_cik AS SELECT * FROM (VALUES ('ACME', 1::BIGINT, 'Acme', 'CS',
+                   NULL::DATE, NULL::DATE)) t(ticker, cik, name, type, valid_from, valid_to)""")
+    con.close()
+    con = duckdb.connect(edgar)
+    con.execute("CREATE SCHEMA events; CREATE SCHEMA raw")
+    con.execute("CREATE TABLE raw.edgar_companies AS SELECT 1 AS cik, 'Acme Corp' AS name UNION ALL SELECT 2, 'Private Co'")
+    con.execute(f"""CREATE TABLE events.announcements AS SELECT * FROM (VALUES
+        ('late', 1, 'acquisition_target', TIMESTAMP '{S}', TIMESTAMP '{SESS[-2]} 16:30', '0001-22-000001'),
+        ('none', 2, 'acquisition_target', TIMESTAMP '{S}', TIMESTAMP '{S} 08:00', '0001-22-000002'))
+        t(event_id, cik, event_type, day0, accepted_et, accession)""")
+    con.close()
+    f = frame({1: 0.30})
+    con = duckdb.connect(prices)
+    con.execute("CREATE SCHEMA raw")
+    bars = pd.concat([pd.DataFrame({"symbol": "ACME", "date": f.index, "close": f.close, "volume": f.volume}),
+                      pd.DataFrame({"symbol": "SPY", "date": f.index, "close": f.spy_close, "volume": 1e8})])
+    bars["adjustment"] = "all"
+    con.register("bars", bars)
+    con.execute("CREATE TABLE raw.alpaca_bars_daily AS SELECT symbol, CAST(date AS DATE) AS date, close, volume, adjustment FROM bars")
+    con.close()
+    out = r.apply(ref, edgar, prices, finra, sample_out=str(tmp_path / "s.csv"), dev_csv=str(tmp_path / "none.csv"))
+    got = out.set_index("event_id")
+    assert got.loc["late", "basis"] == "late_8k_shift" and got.loc["late", "day0"] == SESS[-2]
+    assert got.loc["none", "basis"] == "no_ticker"
+    sample = pd.read_csv(tmp_path / "s.csv")
+    assert list(sample.event_id) == ["late"] and "0001-22-000001-index.htm" in sample.filing_index[0]
+    con = duckdb.connect(edgar, read_only=True)
+    assert con.execute("SELECT count(*) FROM events.target_day0").fetchone()[0] == 2
