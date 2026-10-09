@@ -323,7 +323,8 @@ def _insert_events(con, lr_no: int, key: str, ext: ReleaseExtraction, text: str)
     return len(events)
 
 
-def run(db: str, model: str, limit: int | None) -> None:
+def run(db: str, model: str, limit: int | None, lrs_from: str | None = None) -> None:
+    """lrs_from: a hand-check CSV; only its releases are extracted (to check a new model against it)."""
     key = model_key(model)
     con = duckdb.connect(db)
     con.execute("CREATE SCHEMA IF NOT EXISTS extracted")
@@ -346,6 +347,9 @@ def run(db: str, model: str, limit: int | None) -> None:
            ORDER BY r.lr_no""",
         [key],
     ).fetchall()
+    if lrs_from:
+        keep = set(pd.read_csv(lrs_from, dtype=str).lr_no.astype(int))
+        todo = [t for t in todo if t[0] in keep]
     if limit:
         todo = todo[:limit]
     print(f"{len(todo)} releases to extract with {key}")
@@ -423,6 +427,49 @@ def sample(db: str, model: str, out: str, n: int = 100, seed: int = 42) -> None:
     print(f"Wrote {len(picked)} rows from {len(ids)} releases to {out}. Fill ok_* with Y or N.")
 
 
+def compare(db: str, model: str, csv: str) -> tuple[float, float]:
+    """Check a model against a reviewed hand-check of another model. The known answers are the rows marked
+    Y for both issuer and announcement date; the model passes a known answer when one of its events in the
+    same release names that issuer (normalized names, fuzzy ratio >= 85) and, for date, gives the same date.
+    Rows marked N have no recorded answer, so this is a check on the answers known, not a full hand-check."""
+    from rapidfuzz import fuzz
+
+    from insider_screen.match import normalize
+    hc = pd.read_csv(csv, dtype=str).fillna("")
+    known = hc[(hc.ok_issuer_name.str.upper() == "Y") & (hc.ok_announcement_date.str.upper() == "Y")]
+    con = duckdb.connect(db, read_only=True)
+    got = con.execute(f"SELECT lr_no, issuer_name, CAST(announcement_date AS VARCHAR) AS d FROM {TABLE} "
+                      "WHERE model = ?", [model_key(model)]).df()
+    con.close()
+    got["lr_no"] = got.lr_no.astype(str)
+    done = set(got.lr_no)
+    missing = sorted(set(known.lr_no) - done)
+    if missing:
+        print(f"{len(missing)} hand-checked releases have no events from {model_key(model)} "
+              f"(not extracted yet, failed, or no events found): {missing[:10]}")
+    issuer_hits = date_hits = 0
+    misses = []
+    for r in known.itertuples(index=False):
+        cand = got[got.lr_no == r.lr_no]
+        names = [(fuzz.token_set_ratio(normalize(r.issuer_name), normalize(n or "")), d) for n, d in zip(cand.issuer_name, cand.d)]
+        best = max(names, default=(0, None))
+        if best[0] >= 85:
+            issuer_hits += 1
+            if (best[1] or "") == (r.announcement_date or ""):
+                date_hits += 1
+            else:
+                misses.append((r.lr_no, r.issuer_name, f"date {best[1]} vs {r.announcement_date or 'none'}"))
+        else:
+            misses.append((r.lr_no, r.issuer_name, "issuer not found"))
+    n = len(known)
+    ir, dr = issuer_hits / n if n else float("nan"), date_hits / n if n else float("nan")
+    print(f"{n} known answers. issuer_name {ir:.3f} {'PASS' if ir >= GATE else 'FAIL'}; "
+          f"announcement_date {dr:.3f} {'PASS' if dr >= GATE else 'FAIL'}")
+    for m in misses[:40]:
+        print("  ", *m)
+    return ir, dr
+
+
 def score(csv: str) -> dict[str, float]:
     df = pd.read_csv(csv, dtype=str).fillna("")
     res = {}
@@ -443,6 +490,11 @@ def main() -> None:
     r.add_argument("--db", default=RELEASES)
     r.add_argument("--model", default=DEFAULT_MODEL)
     r.add_argument("--limit", type=int)
+    r.add_argument("--lrs-from", help="only the releases in this hand-check CSV")
+    cp = sub.add_parser("compare", help="check a model against the reviewed hand-check of another model")
+    cp.add_argument("--db", default=RELEASES)
+    cp.add_argument("--model", default=DEFAULT_MODEL)
+    cp.add_argument("--csv", default="data/handcheck.csv")
     s = sub.add_parser("sample")
     s.add_argument("--db", default=RELEASES)
     s.add_argument("--model", default=DEFAULT_MODEL)
@@ -454,7 +506,9 @@ def main() -> None:
     c.add_argument("--csv", default="data/handcheck.csv")
     a = ap.parse_args()
     if a.cmd == "run":
-        run(a.db, a.model, a.limit)
+        run(a.db, a.model, a.limit, a.lrs_from)
+    elif a.cmd == "compare":
+        compare(a.db, a.model, a.csv)
     elif a.cmd == "reclean":
         reclean(a.db, a.model)
     elif a.cmd == "sample":

@@ -204,3 +204,24 @@ def test_trade_dates_split_only_when_far_apart():
     rows = clean_events(ext([tev("2023-06-01", "again on June 1, 2023"),
                              tev("2023-01-03", "Earlier he bought on January 3, 2023")]), text)
     assert len(rows) == 2
+
+
+def test_compare_against_reviewed_handcheck(tmp_path):
+    import duckdb
+    import pandas as pd
+
+    from insider_screen import extract as ex
+    db = str(tmp_path / "releases.duckdb")
+    con = duckdb.connect(db)
+    con.execute("CREATE SCHEMA extracted")
+    con.execute(f"""CREATE TABLE {ex.TABLE} AS SELECT * FROM (VALUES
+        (1, '{ex.model_key("small")}', 'Acme Corp.', DATE '2020-01-02'),
+        (2, '{ex.model_key("small")}', 'Beta Inc', DATE '2020-05-05'),
+        (3, '{ex.model_key("small")}', 'Lumentum', DATE '2021-01-19')) t(lr_no, model, issuer_name, announcement_date)""")
+    con.close()
+    csv = tmp_path / "h.csv"
+    pd.DataFrame({"lr_no": ["1", "2", "3", "4"], "issuer_name": ["Acme Corporation", "Beta, Inc.", "Coherent", "Old"],
+                  "announcement_date": ["2020-01-02", "2020-05-06", "2021-01-19", ""],
+                  "ok_issuer_name": ["Y", "Y", "Y", "N"], "ok_announcement_date": ["Y", "Y", "Y", "Y"]}).to_csv(csv, index=False)
+    ir, dr = ex.compare(db, "small", str(csv))
+    assert (round(ir, 3), round(dr, 3)) == (0.667, 0.333)
