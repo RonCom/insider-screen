@@ -11,8 +11,8 @@ Per event and window:
   the baseline, and the same divided by the residual SD x sqrt(window sessions)
 - short_share_abn, short_share_z: FINRA off-exchange short share (short volume / total volume) in the
   window minus the baseline's, and that difference over its standard error from the baseline's daily SD
-- abn_short_trades: log of mean daily short-sale trade count, window over baseline (monthly files)
-- small_trade_share_abn: share of short-sale trades of 100 shares or fewer, window minus baseline
+- abn_short_trades, small_trade_share_abn: from the monthly transaction files, computed only if they're
+  loaded; dropped from the study (spec change log, 2026-10-09), so normally empty
 Plus price_d30 (raw close at day -30, for the $1 floor), dollar_volume (baseline median of raw close x
 volume, the size proxy: no shares-outstanding source is free, so market cap isn't available) and SIC.
 
