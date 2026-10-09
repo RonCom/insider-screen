@@ -246,3 +246,25 @@ def test_runaway_reasoning_retried_without_it():
     client = httpx.Client(transport=httpx.MockTransport(handler))
     assert call_ollama("text", "m", client).events[0].issuer_name == "Target Co."
     assert seen[1] is False and "without reasoning" in ex.NOTES[0]
+
+
+def test_fallback_redoes_empty_release_with_reasoning(tmp_path, monkeypatch):
+    db = str(tmp_path / "t.duckdb")
+    con = duckdb.connect(db)
+    con.execute("CREATE SCHEMA raw")
+    con.execute("CREATE TABLE raw.sec_litigation_releases AS SELECT 1 AS lr_no, ? AS text, TRUE AS is_insider_candidate, 'u' AS url", [TEXT])
+    con.close()
+    monkeypatch.setattr(extract, "THINK_FALLBACK", True)
+    calls = []
+
+    def fake(text, model, client, think=None):
+        calls.append(think)
+        return ext([]) if think is False else ext([ev()])
+    monkeypatch.setattr(extract, "call_ollama", fake)
+    extract.run(db, "m", None)
+    assert calls == [False, None]
+    con = duckdb.connect(db)
+    assert extract.model_key("m").endswith("-fallback")
+    note = con.execute("SELECT error FROM extracted.release_extractions").fetchone()[0]
+    assert note.startswith("redone with reasoning")
+    assert con.execute("SELECT count(*) FROM extracted.traded_events").fetchone()[0] == 1

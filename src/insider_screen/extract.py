@@ -20,7 +20,8 @@ Usage:
     uv run python -m insider_screen.extract sample --model qwen3:8b --out data/handcheck.csv
 
 Settings (shell or .env): OLLAMA_MODEL, OLLAMA_NUM_CTX (default 8192; 5120 fits qwen3:8b on an 8 GB GPU),
-OLLAMA_THINK (false turns off qwen3's reasoning; leave unset for models without it).
+OLLAMA_THINK (false turns off reasoning; fallback runs without reasoning and repeats with reasoning on any
+release that fails or names no event; leave unset for the model's default).
     uv run python -m insider_screen.extract score --csv data/handcheck.csv
     uv run python -m insider_screen.extract reclean --model gemma4:e4b   # re-apply checks to stored output
 """
@@ -46,7 +47,9 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:8b")
 PROMPT_VERSION = "v5"
 NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "8192"))
-THINK = {"true": True, "false": False}.get(os.environ.get("OLLAMA_THINK", "").lower())
+_THINK_ENV = os.environ.get("OLLAMA_THINK", "").lower()
+THINK = {"true": True, "false": False}.get(_THINK_ENV)
+THINK_FALLBACK = _THINK_ENV == "fallback"
 TABLE = f"extracted.traded_events_{PROMPT_VERSION}"
 GATE = 0.90  # spec: >= 90% accuracy on issuer and announcement date
 
@@ -136,7 +139,8 @@ last_trade_date null (no trade date stated), event_type acquisition_target, inst
 def model_key(model: str) -> str:
     """Rows are stored per model, prompt version and reasoning setting, so a run with OLLAMA_THINK=false
     never mixes with (or skips because of) a run with reasoning on."""
-    return f"{model}#{PROMPT_VERSION}{'-nothink' if THINK is False else ''}"
+    suffix = "-nothink" if THINK is False else "-fallback" if THINK_FALLBACK else ""
+    return f"{model}#{PROMPT_VERSION}{suffix}"
 
 
 WAIT_FOR_OLLAMA = 600  # seconds to keep retrying when Ollama isn't answering (starting up, loading the model)
@@ -160,13 +164,13 @@ def _post_waiting(client: httpx.Client, payload: dict) -> httpx.Response:
 NOTES: list[str] = []  # how the last call_ollama got its answer, when it needed a retry
 
 
-def call_ollama(text: str, model: str, client: httpx.Client) -> ReleaseExtraction:
+def call_ollama(text: str, model: str, client: httpx.Client, think: bool | None = None) -> ReleaseExtraction:
     payload = {
         "model": model,
         "stream": False,
         "format": ReleaseExtraction.model_json_schema(),
         "options": {"temperature": 0, "num_ctx": NUM_CTX},
-        **({"think": THINK} if THINK is not None else {}),
+        **({"think": think if think is not None else THINK} if (think is not None or THINK is not None) else {}),
         "messages": [
             {"role": "system", "content": SYSTEM},
             {"role": "user", "content": text[: (NUM_CTX - 1500) * 4]},
@@ -398,10 +402,23 @@ def run(db: str, model: str, limit: int | None, lrs_from: str | None = None) -> 
         for i, (lr_no, text) in enumerate(todo, 1):
             t0 = time.monotonic()
             try:
-                ext = call_ollama(text, model, client)
-                _record(con, (lr_no, key, True, "; ".join(NOTES) or None, ext.model_dump_json()))
+                fallback_note = None
+                if THINK_FALLBACK:
+                    # fast pass without reasoning; a release that fails or names no event is redone with it
+                    try:
+                        ext = call_ollama(text, model, client, think=False)
+                        if not ext.events:
+                            raise ValueError("no events")
+                    except (ValidationError, ValueError, httpx.HTTPStatusError, KeyError) as first_err:
+                        fallback_note = f"redone with reasoning ({str(first_err).splitlines()[0][:60]})"
+                        ext = call_ollama(text, model, client)
+                else:
+                    ext = call_ollama(text, model, client)
+                notes = ([fallback_note] if fallback_note else []) + NOTES
+                _record(con, (lr_no, key, True, "; ".join(notes) or None, ext.model_dump_json()))
                 con.execute(f"DELETE FROM {TABLE} WHERE lr_no = ? AND model = ?", [lr_no, key])
                 n_events = _insert_events(con, lr_no, key, ext, text)
+                NOTES[:] = notes
                 status = f"{n_events} event{'s' if n_events != 1 else ''}" + (f" ({'; '.join(NOTES)})" if NOTES else "")
             except (ValidationError, ValueError, httpx.HTTPError, KeyError) as err:
                 _record(con, (lr_no, key, False, str(err)[:500], None))
