@@ -120,8 +120,13 @@ def headline_of(top: str) -> str | None:
     candidates = [ln for ln in top.splitlines()
                   if not SKIP_LINE_RE.match(ln) and not DATE_RE.search(ln) and not BOILERPLATE_RE.search(ln)]
     for min_words in (5, 3):
-        for ln in candidates:
+        for i, ln in enumerate(candidates):
             if len(ln.split()) >= min_words and not ln.isupper() or len(ln.split()) >= 8:
+                # a headline wrapped onto the next line ends mid-phrase: "... Merger of Equals,"
+                while i + 1 < len(candidates) and re.search(r"(?:[,;:\-–]|\b(?:and|of|the|to|for|with|in|a|an|by))$",
+                                                           ln, re.I):
+                    i += 1
+                    ln = f"{ln} {candidates[i]}"
                 return ln[:200]
     return None
 
@@ -149,8 +154,10 @@ def search_urls(html: str | bytes) -> list[str]:
 
 # Each wire's own search page, and the path its article links use.
 SITE_SEARCH = {
-    "PR Newswire": ("https://www.prnewswire.com/search/news/?keyword={q}&pagesize=25", "/news-releases/"),
-    "GlobeNewswire": ("https://www.globenewswire.com/search/keyword/{q}", "/news-release/"),
+    "PR Newswire": ("https://www.prnewswire.com/search/news/?keyword={q}&pagesize=25",
+                    re.compile(r"^/news-releases/[^/]+-\d{6,}\.html$")),
+    "GlobeNewswire": ("https://www.globenewswire.com/search/keyword/{q}",
+                      re.compile(r"^/news-release/\d{4}/\d{2}/\d{2}/\d+/")),
 }
 
 
@@ -158,14 +165,17 @@ def site_search_url(wire: str, query: str) -> str:
     return SITE_SEARCH[wire][0].format(q=quote_plus(query))
 
 
-def article_links(html: str | bytes, base: str, path: str) -> list[str]:
-    """Article links on a wire's own search results page."""
-    out = []
+def article_links(html: str | bytes, base: str, path: re.Pattern, headline: str = "") -> list[str]:
+    """Article links on a wire's own search results page (menu and category links are skipped), best
+    match to the headline first. The link text is the article's title."""
+    scored: dict[str, float] = {}
     for a in BeautifulSoup(html, "lxml").find_all("a", href=True):
-        url = urljoin(base, a["href"].split("#")[0])
-        if path in urlparse(url).path and url not in out:
-            out.append(url)
-    return out
+        url = urljoin(base, a["href"].split("#")[0].split("?")[0])
+        if not path.search(urlparse(url).path):
+            continue
+        score = fuzz.token_set_ratio(headline.lower(), a.get_text(" ", strip=True).lower()) if headline else 0
+        scored[url] = max(score, scored.get(url, 0))
+    return sorted(scored, key=lambda u: -scored[u])
 
 
 def ddg_url(query: str) -> str:
@@ -316,7 +326,7 @@ def _candidates(web, wire: str | None, headline: str) -> tuple[list[str], list[s
     for w in wires:
         url = site_search_url(w, q)
         status, page = _get(web, url, use_cache=False, store=False)
-        found = article_links(page, url, SITE_SEARCH[w][1]) if status == 200 else []
+        found = article_links(page, url, SITE_SEARCH[w][1], headline) if status == 200 else []
         log.append(f"{w} search {status}: {len(found)} links")
         urls += [u for u in found if u not in urls]
     if urls:

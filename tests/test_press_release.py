@@ -124,9 +124,23 @@ def test_headline_is_first_line_not_longest():
     assert (wire, d, head) == (None, date(2023, 11, 2), "Six Flags and Cedar Fair to Combine in Merger of Equals")
 
 
-PRN_SEARCH = f"""<html><body><div class="row newsCards">
-<a class="newsreleaseconsolidatelink" href="/news-releases/six-flags-and-cedar-fair-to-combine-301975271.html">Six Flags</a>
+PRN_SEARCH = f"""<html><body><nav><a href="/news-releases/">News</a><a href="/news-releases/multimedia/">Multimedia</a>
+<a href="/news-releases/news-releases-list/">All</a></nav><div class="row newsCards">
+<a class="newsreleaseconsolidatelink" href="/news-releases/six-flags-reports-third-quarter-301900001.html">Six Flags Reports Third Quarter Results</a>
+<a class="newsreleaseconsolidatelink" href="/news-releases/six-flags-and-cedar-fair-to-combine-301975271.html">Six Flags and Cedar Fair to Combine in Merger of Equals, Creating a Leading Amusement Park Operator</a>
 <a href="/news/six-flags-entertainment-corporation/">company page</a></div></body></html>"""
+
+
+def test_article_links_skip_menus_and_rank_by_title():
+    links = pr.article_links(PRN_SEARCH, "https://www.prnewswire.com/search/news/?keyword=x",
+                             pr.SITE_SEARCH["PR Newswire"][1], "Six Flags and Cedar Fair to Combine in Merger of Equals")
+    assert links == [ARTICLE_URL, "https://www.prnewswire.com/news-releases/six-flags-reports-third-quarter-301900001.html"]
+
+
+def test_wrapped_headline_joined():
+    text = "Six Flags and Cedar Fair to Combine in Merger of Equals,\nCreating a Leading Amusement Park Operator\nARLINGTON, Texas, Nov. 2, 2023 -- text"
+    assert pr.read_exhibit(text)[2] == ("Six Flags and Cedar Fair to Combine in Merger of Equals, "
+                                         "Creating a Leading Amusement Park Operator")
 
 
 def test_wire_site_search_used_first():
