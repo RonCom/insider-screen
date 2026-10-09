@@ -380,3 +380,34 @@ def test_names_accepts_a_map_cik_edgar_does_not_contradict(tmp_path):
     out = tk.names(db, edgar)
     # VSR: valid on the August event though delisted before November; ACME belongs to CIK 42, named otherwise
     assert list(zip(out.cik, out.ticker)) == [(803647, "VSR")] and "1541910" in out.how[0]
+
+
+def test_names_rejects_a_ticker_another_company_carries(tmp_path):
+    """Duke Energy Carolinas' former name is Duke Energy Corp; DUK belongs to the parent, whose events carry it."""
+    db, edgar = str(tmp_path / "reference.duckdb"), str(tmp_path / "edgar.duckdb")
+    con = duckdb.connect(db)
+    con.execute("CREATE SCHEMA ref")
+    con.execute("""CREATE TABLE ref.ticker_cik AS SELECT ticker, cik::BIGINT AS cik, name, 'CS' AS type,
+                   valid_from::DATE AS valid_from, valid_to::DATE AS valid_to FROM (VALUES
+        ('DUK', 1326160, 'Duke Energy Corporation', NULL, NULL),
+        ('HONE', 1728219, 'HarborOne Bancorp, Inc.', NULL, NULL)) t(ticker, cik, name, valid_from, valid_to)""")
+    con.execute("""CREATE TABLE ref.ticker_supplement AS SELECT * FROM (VALUES
+        (5::BIGINT, 2019, 'OLD'::VARCHAR, FALSE, NULL::VARCHAR, 'name match: stale'))
+        t(cik, year, ticker, conflict, accession, how)""")
+    con.close()
+    con = duckdb.connect(edgar)
+    con.execute("CREATE SCHEMA events; CREATE SCHEMA raw")
+    con.execute("""CREATE TABLE raw.edgar_companies AS SELECT * FROM (VALUES
+        (30371, 'Duke Energy Carolinas, LLC', 'DUKE ENERGY CORP'), (1326160, 'Duke Energy CORP', ''),
+        (1668224, 'HarborOne Bancorp, Inc./OLD', ''), (1728219, 'HarborOne Bancorp, Inc.', ''), (5, 'Stale Co', ''))
+        t(cik, name, former_names)""")
+    con.execute("""CREATE TABLE events.announcements AS SELECT * FROM (VALUES
+        ('d1', 30371, 'earnings', TIMESTAMP '2022-05-01'), ('d2', 1326160, 'earnings', TIMESTAMP '2022-05-01'),
+        ('h1', 1668224, 'earnings', TIMESTAMP '2019-04-25'), ('h2', 1728219, 'earnings', TIMESTAMP '2019-10-24'),
+        ('s1', 5, 'earnings', TIMESTAMP '2019-01-01')) t(event_id, cik, event_type, day0)""")
+    con.close()
+    out = tk.names(db, edgar)
+    # HarborOne's old holding company kept HONE until the second step; the new one's events start later
+    assert list(zip(out.cik, out.ticker)) == [(1668224, "HONE")]
+    con = duckdb.connect(db)
+    assert con.execute("SELECT count(*) FROM ref.ticker_supplement WHERE cik = 5").fetchone()[0] == 0

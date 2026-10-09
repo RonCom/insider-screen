@@ -309,13 +309,24 @@ def names(db: str = REFERENCE, edgar_db: str = EDGAR, finra_db: str = FINRA) -> 
     a map row whose name equals the company's current or former EDGAR name (after normalizing) and whose
     dates overlap the year's events. The map row may have no CIK (Massive leaves it off many delisted
     tickers) or a CIK that EDGAR doesn't know or knows under the same name (Versar's VSR carries
-    another CIK). Taken only when exactly one ticker matches and no differently named company holds it."""
+    another CIK). Taken only when exactly one ticker matches, no differently named company holds it, and
+    no other company's events carry it, through the CIK join, between the year's first and last event
+    (that rejects a parent's ticker for a subsidiary, e.g. DUK for Duke Energy Carolinas, whose former
+    name is Duke Energy Corp, and another firm of the same short name, e.g. PHI Inc for PHI Group)."""
     con = duckdb.connect(db)
     con.execute("CREATE SCHEMA IF NOT EXISTS ref")
     con.execute("""CREATE TABLE IF NOT EXISTS ref.ticker_supplement (
         cik BIGINT, year INTEGER, ticker VARCHAR, conflict BOOLEAN, accession VARCHAR, how VARCHAR)""")
     attach(con, edgar_db, finra_db)
+    # rerun from scratch, so a tightened rule also removes matches it no longer makes
+    dropped = con.execute("DELETE FROM ref.ticker_supplement WHERE how LIKE 'name match%'").fetchone()[0]
     mapped = ticker_on_sql(con, "edgar.events.announcements")
+    # each ticker's events through the CIK join: a ticker another company's events carry over the same
+    # dates belongs to that company (a parent, an operating subsidiary, a different firm of the same name)
+    taken: dict[str, list] = {}
+    for t, cik, day in con.execute(f"""SELECT ticker, cik, CAST(day0 AS DATE) FROM ({mapped})
+                                       WHERE ticker IS NOT NULL""").fetchall():
+        taken.setdefault(t, []).append((pd.Timestamp(day), int(cik)))
     todo = con.execute(f"""
         WITH m AS ({mapped})
         SELECT m.cik, year(m.day0) AS year, {_names_sql(con)} AS names,
@@ -357,6 +368,8 @@ def names(db: str = REFERENCE, edgar_db: str = EDGAR, finra_db: str = FINRA) -> 
                         & (cands.valid_to.isna() | (cands.valid_to >= lo))]
         if any(int(h) != int(r.cik) and not same_company(h, _name_key(mname)) for h in holders.cik):
             continue
+        if any(pd.Timestamp(lo) <= day <= pd.Timestamp(hi) and cik != int(r.cik) for day, cik in taken.get(ticker, [])):
+            continue
         how = (f"name match: '{mname}' in the map has no CIK" if pd.isna(mcik)
                else f"name match: '{mname}' in the map under CIK {int(mcik)}")
         rows.append((int(r.cik), int(r.year), ticker, False, None, how))
@@ -365,7 +378,8 @@ def names(db: str = REFERENCE, edgar_db: str = EDGAR, finra_db: str = FINRA) -> 
     if rows:
         con.executemany("INSERT INTO ref.ticker_supplement VALUES (?, ?, ?, ?, ?, ?)", rows)
     con.close()
-    print(f"{len(todo)} company-years without a ticker; {len(rows)} matched by name to a map row")
+    print(f"{len(todo)} company-years without a ticker; {len(rows)} matched by name to a map row "
+          f"({dropped} earlier name matches recomputed)")
     return pd.DataFrame(rows, columns=["cik", "year", "ticker", "conflict", "accession", "how"])
 
 
