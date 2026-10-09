@@ -299,7 +299,9 @@ _SECURITY_TAIL_RE = re.compile(r"\b(?:class [a-z] )?(?:common|ordinary|capital) 
 
 def _name_key(name: str | None) -> str:
     from insider_screen.match import normalize
-    return normalize(_SECURITY_TAIL_RE.sub("", name or ""))
+    if not isinstance(name, str):  # a map row with no name comes back from pandas as NaN
+        return ""
+    return normalize(_SECURITY_TAIL_RE.sub("", name))
 
 
 def names(db: str = REFERENCE, edgar_db: str = EDGAR, finra_db: str = FINRA) -> pd.DataFrame:

@@ -365,7 +365,7 @@ def test_names_accepts_a_map_cik_edgar_does_not_contradict(tmp_path):
     con.execute("""CREATE TABLE ref.ticker_cik AS SELECT ticker, cik::BIGINT AS cik, name, 'CS' AS type,
                    valid_from::DATE AS valid_from, valid_to::DATE AS valid_to FROM (VALUES
         ('VSR', 1541910, 'Versar, Inc.', NULL, '2017-09-26'),       -- CIK EDGAR doesn't know
-        ('ACME', 42, 'Acme Corp', NULL, NULL)) t(ticker, cik, name, valid_from, valid_to)""")
+        ('ACME', 42, 'Acme Corp', NULL, NULL), ('NONAME', NULL, NULL, NULL, NULL)) t(ticker, cik, name, valid_from, valid_to)""")
     con.close()
     con = duckdb.connect(edgar)
     con.execute("CREATE SCHEMA events; CREATE SCHEMA raw")
