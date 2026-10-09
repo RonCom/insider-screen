@@ -22,6 +22,7 @@ Each loader writes its own DuckDB file, so long runs (an extraction and a price 
 | `data/edgar.duckdb` | `edgar` |
 | `data/finra.duckdb` | `shortsale daily`, `shortsale monthly` |
 | `data/prices.duckdb` | `prices` |
+| `data/reference.duckdb` | `tickers` |
 
 `match` reads `edgar.duckdb` and `prices` reads `finra.duckdb`, both read-only; each fails while the other file's loader is running. Data from before this split, in `data/insider.duckdb`, moves over with:
 
@@ -121,4 +122,15 @@ uv run python -m insider_screen.day0check fill     # looks up each 8-K's press r
 uv run python -m insider_screen.day0check market   # first abnormal minute-bar move per event (Alpaca keys in .env)
 uv run python -m insider_screen.day0check score --column market_move_et
 uv run python -m insider_screen.day0check daily    # daily-bar day-0 rule on the sample, compared with the minute check
+```
+
+## Ticker-to-CIK map: Massive reference data
+
+```powershell
+# MASSIVE_API_KEY in .env (free plan). Every US stock ticker, active and delisted: 10-15 minutes at 5 requests a minute; resumable
+uv run python -m insider_screen.tickers download
+# ref.ticker_cik: which CIK held each ticker over which dates (reused tickers split at delistings)
+uv run python -m insider_screen.tickers build
+# share of events with a ticker on day 0, by event type and year
+uv run python -m insider_screen.tickers coverage
 ```
