@@ -118,5 +118,6 @@ uv run python -m insider_screen.extract score
 uv run python -m insider_screen.day0check sample   # data/day0_check.csv: fill press_release_et
 uv run python -m insider_screen.day0check fill     # looks up each 8-K's press release on its newswire;
                                                    # resumable; unresolved rows get a note and a search link
-uv run python -m insider_screen.day0check score
+uv run python -m insider_screen.day0check market   # first abnormal minute-bar move per event (Alpaca keys in .env)
+uv run python -m insider_screen.day0check score --column market_move_et
 ```

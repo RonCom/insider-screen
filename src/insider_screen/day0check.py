@@ -8,6 +8,8 @@ Usage:
     uv run python -m insider_screen.day0check sample      # writes data/day0_check.csv
     uv run python -m insider_screen.day0check fill        # looks up press-release times (press_release.py)
     uv run python -m insider_screen.day0check score
+    uv run python -m insider_screen.day0check market      # first market move per event (market_move.py)
+    uv run python -m insider_screen.day0check score --column market_move_et
 
 In the CSV, fill press_release_et with the release's date and Eastern time ("2021-06-16 07:00"),
 press_release_source with the URL you took it from, and notes as needed. Leave press_release_et
@@ -92,13 +94,57 @@ def fill(csv: str, sec=None, web=None, limit: int | None = None) -> pd.DataFrame
     return df
 
 
-def score(csv: str) -> pd.DataFrame:
+def market(csv: str, api=None, sec=None, cal=None) -> pd.DataFrame:
+    """Fill ticker, market_move_et and market_move_note for rows without a market_move_et. Saves per row."""
+    import os
+
+    from insider_screen import market_move
+    from insider_screen.prices import Alpaca
+    if api is None:
+        key, secret = os.environ.get("ALPACA_API_KEY_ID"), os.environ.get("ALPACA_API_SECRET_KEY")
+        if not key or not secret:
+            raise SystemExit("Set ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY (in .env)")
+        api = Alpaca(key, secret)
+    sec = sec or PoliteClient(cache_dir="data/cache/sec", user_agent=DEFAULT_USER_AGENT, max_per_second=5)
+    cal = cal or xc.get_calendar("XNYS", start="2015-01-01")
     df = pd.read_csv(csv, dtype=str, encoding="utf-8-sig").fillna("")
-    filled = df[df.press_release_et.str.strip() != ""].copy()
-    pr = pd.to_datetime(filled.press_release_et.str.strip(), errors="coerce")
+    for col in ("ticker", "market_move_et", "market_move_note"):
+        if col not in df:
+            df[col] = ""
+    todo = df.index[df.market_move_et.str.strip() == ""]
+    print(f"{len(todo)} of {len(df)} rows to check")
+    for n, i in enumerate(todo, 1):
+        row = df.loc[i]
+        filed = pd.Timestamp(row.accepted_et).date() if row.get("accepted_et", "") else None
+        try:
+            ticker, how = (row.ticker, "ticker from the CSV") if row.ticker.strip() else \
+                market_move.release_ticker(sec, row.filing_index, filed, row.company)
+            if not ticker:
+                t, note = None, how
+            else:
+                t, note = market_move.locate(api, ticker.strip(), pd.Timestamp(row.day0).date(), cal)
+                note = f"{note}; {how}"
+        except Exception as err:  # one bad row shouldn't stop the run
+            ticker, t, note = row.ticker, None, f"lookup failed: {err}"[:300]
+        df.at[i, "ticker"] = ticker or ""
+        df.at[i, "market_move_et"] = f"{t:%Y-%m-%d %H:%M}" if t is not None else ""
+        df.at[i, "market_move_note"] = note
+        df.to_csv(csv, index=False, encoding="utf-8-sig")
+        print(f"  {n}/{len(todo)} {row.company[:40]} ({ticker or '?'}): {df.at[i, 'market_move_et'] or 'none'}")
+    done = (df.market_move_et.str.strip() != "").sum()
+    print(f"{done} of {len(df)} rows have a market move; score with --column market_move_et")
+    return df
+
+
+def score(csv: str, column: str = "press_release_et") -> pd.DataFrame:
+    df = pd.read_csv(csv, dtype=str, encoding="utf-8-sig").fillna("")
+    if column not in df:
+        raise SystemExit(f"{csv} has no column {column}")
+    filled = df[df[column].str.strip() != ""].copy()
+    pr = pd.to_datetime(filled[column].str.strip(), errors="coerce")
     bad = filled[pr.isna()]
     if len(bad):
-        print(f"Unreadable press_release_et (use 'YYYY-MM-DD HH:MM'): {bad.event_id.tolist()}")
+        print(f"Unreadable {column} (use 'YYYY-MM-DD HH:MM'): {bad.event_id.tolist()}")
     filled = filled[pr.notna()]
     pr = pr[pr.notna()]
     cal = xc.get_calendar("XNYS", start="2010-01-01")
@@ -111,7 +157,7 @@ def score(csv: str) -> pd.DataFrame:
     print(f"{len(filled)} of {len(df)} events checked; {len(df) - len(filled)} left blank")
     print(f"{len(differing)} differ by a trading session or more (threshold: more than {MAX_DIFFERING})")
     if len(differing):
-        print(differing[["event_id", "company", "accepted_et", "press_release_et", "session_diff"]].to_string(index=False))
+        print(differing[["event_id", "company", "accepted_et", column, "session_diff"]].to_string(index=False))
     if len(filled) < min(N, len(df)):
         print(f"Verdict pending: {N - len(filled)} more events needed for the spec's 50.")
     elif len(differing) > MAX_DIFFERING:
@@ -131,15 +177,20 @@ def main() -> None:
     f = sub.add_parser("fill")
     f.add_argument("--csv", default="data/day0_check.csv")
     f.add_argument("--limit", type=int, help="Look up only this many blank rows (for a quick test)")
+    m = sub.add_parser("market")
+    m.add_argument("--csv", default="data/day0_check.csv")
     c = sub.add_parser("score")
     c.add_argument("--csv", default="data/day0_check.csv")
+    c.add_argument("--column", default="press_release_et", help="press_release_et or market_move_et")
     a = ap.parse_args()
     if a.cmd == "sample":
         sample(a.db, a.out, a.n)
     elif a.cmd == "fill":
         fill(a.csv, limit=a.limit)
+    elif a.cmd == "market":
+        market(a.csv)
     else:
-        score(a.csv)
+        score(a.csv, a.column)
 
 
 if __name__ == "__main__":
