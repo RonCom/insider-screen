@@ -72,7 +72,7 @@ def test_short_history_leaves_features_empty():
 def test_build_targets_end_to_end(tmp_path):
     import duckdb
     edgar, ref, prices, finra, out = (str(tmp_path / f) for f in
-                                      ("edgar.duckdb", "reference.duckdb", "prices.duckdb", "finra.duckdb", "f.duckdb"))
+                                      ("edgar.duckdb", "reference.duckdb", "prices.duckdb", "finra.duckdb", "event_features.duckdb"))
     cal_sessions = [s.date() for s in ft.xc.get_calendar("XNYS", start="2015-01-01").sessions_in_range("2019-01-02", "2021-06-30")]
     day0 = cal_sessions[400]
     con = duckdb.connect(edgar)
