@@ -278,3 +278,25 @@ def test_ticker_wordings():
     assert ticker_from_text("Acme Inc. listed on the NYSE: the company said", "ACME INC")[0] is None
     # the reason lists the tickers found
     assert "['BETA']" in ticker_from_text("Beta Corp (NYSE: BETA) will buy it", "ACME INC")[1]
+
+
+def test_untyped_delisted_rows_kept_unless_not_stock(tmp_path):
+    db = str(tmp_path / "reference.duckdb")
+    con = duckdb.connect(db)
+    tk._setup(con)
+    rows = [
+        ("OLDC", "Old Company Inc", "0000000101", None, "2017-05-01T00:00:00Z"),    # untyped stock: kept
+        ("OLDCW", "Old Company Inc", "0000000101", None, "2017-05-01T00:00:00Z"),   # base + W: dropped
+        ("OLDC.U", "Old Company Inc", "0000000101", None, "2016-01-01T00:00:00Z"),  # base + .U: dropped
+        ("ZZW", "Zeta Acquisition Corp Warrants", "0000000102", None, "2019-01-01T00:00:00Z"),  # name: dropped
+        ("PFX", "Pfx Corp 6.5% Notes due 2025", "0000000103", None, "2019-01-01T00:00:00Z"),     # name: dropped
+        ("NOCIK", "No Cik Inc", None, None, "2018-01-01T00:00:00Z"),                # no CIK: dropped
+        ("TYPED", "Typed Inc", "0000000104", "CS", "2018-01-01T00:00:00Z"),          # typed stock: kept
+    ]
+    for t, name, cik, typ, delisted in rows:
+        con.execute("INSERT INTO raw.massive_tickers VALUES (?, ?, ?, ?, FALSE, 'XNYS', NULL, NULL, ?, NULL, now())",
+                    [t, name, cik, typ, delisted])
+    con.close()
+    out = tk.build(db)
+    assert sorted(out.ticker) == ["OLDC", "TYPED"]
+    assert dict(zip(out.ticker, out.type)) == {"OLDC": "untyped", "TYPED": "CS"}

@@ -49,6 +49,10 @@ FIELDS = ["ticker", "name", "cik", "type", "active", "primary_exchange", "compos
           "delisted_utc", "last_updated_utc"]
 # security types kept in the map: common stock, ADRs, and the like; funds, warrants, units, rights are left out
 STOCK_TYPES = ("CS", "ADRC", "ADRP", "ADRS", "OS", "NYRS", "GDR")
+# Older delisted tickers often have no type in Massive (6,742 of 23,492 delisted rows). Those with a CIK are
+# kept as 'untyped' unless the name or ticker shows another kind of security.
+NOT_STOCK_NAME_RE = (r"(?i)\b(warrants?|units?|rights?|preferred|pfd|depositary shares?|notes?|debentures?|"
+                     r"etf|etn|fund|index|trust preferred|subordinated|senior|%)\b|%")
 
 
 class Massive:
@@ -149,10 +153,17 @@ def build(db: str = REFERENCE) -> pd.DataFrame:
     """ref.ticker_cik from raw.massive_tickers: one row per (ticker, CIK) holding with its date range."""
     con = duckdb.connect(db)
     raw = con.execute(
-        f"""SELECT DISTINCT ticker, TRY_CAST(cik AS BIGINT) AS cik, name, type, active, primary_exchange,
-                   composite_figi, CAST(TRY_CAST(delisted_utc AS TIMESTAMP) AS DATE) AS delisted
-            FROM raw.massive_tickers
-            WHERE type IN ({', '.join(repr(t) for t in STOCK_TYPES)})""").df()
+        f"""WITH r AS (
+              SELECT DISTINCT ticker, TRY_CAST(cik AS BIGINT) AS cik, name, coalesce(type, 'untyped') AS type, active,
+                     primary_exchange, composite_figi, CAST(TRY_CAST(delisted_utc AS TIMESTAMP) AS DATE) AS delisted
+              FROM raw.massive_tickers)
+            SELECT * FROM r
+            WHERE type IN ({', '.join(repr(t) for t in STOCK_TYPES)})
+               OR (type = 'untyped' AND cik IS NOT NULL
+                   AND NOT regexp_matches(coalesce(name, ''), '{NOT_STOCK_NAME_RE}')
+                   -- another ticker of the same company plus a warrant/unit/right suffix
+                   AND NOT EXISTS (SELECT 1 FROM r b WHERE b.cik = r.cik AND b.ticker <> r.ticker
+                                   AND regexp_matches(r.ticker, '^' || regexp_escape(b.ticker) || '[.-]?(W|WS|WT|U|UN|R|RT)$')))""").df()
     out = ticker_ranges(raw)
     con.execute("CREATE SCHEMA IF NOT EXISTS ref")
     con.register("out", out)
