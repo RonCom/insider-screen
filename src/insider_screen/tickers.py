@@ -53,6 +53,10 @@ STOCK_TYPES = ("CS", "ADRC", "ADRP", "ADRS", "OS", "NYRS", "GDR")
 # kept as 'untyped' unless the name or ticker shows another kind of security.
 NOT_STOCK_NAME_RE = (r"(?i)\b(warrants?|units?|rights?|preferred|pfd|depositary shares?|notes?|debentures?|"
                      r"etf|etn|fund|index|trust preferred|subordinated|senior|%)\b|%")
+# typed rows too: Massive types Diversified Healthcare Trust's senior notes (DHCNI, DHCNL) as CS, and
+# when-issued lines (SNHVV) as well. Narrower than NOT_STOCK_NAME_RE, which would also drop MLP units
+# and names like "Senior Housing Properties Trust"
+NOT_STOCK_TYPED_RE = r"(?i)\bnotes?\b|\bdebentures?\b|\bpreferred\b|\bpfd\b|\bwarrants?\b|\bwhen[ -]issued\b|%"
 # exchange test symbols (NTEST.B was mapped to Cash America; ZVZZT, ZXZZT and the like are Nasdaq's)
 TEST_SYMBOL_RE = r"TEST|^Z[A-Z]ZZT"
 
@@ -161,6 +165,7 @@ def build(db: str = REFERENCE) -> pd.DataFrame:
               FROM raw.massive_tickers)
             SELECT * FROM r
             WHERE NOT regexp_matches(ticker, '{TEST_SYMBOL_RE}')
+              AND NOT regexp_matches(coalesce(name, ''), '{NOT_STOCK_TYPED_RE}')
               AND (type IN ({', '.join(repr(t) for t in STOCK_TYPES)})
                OR (type = 'untyped' AND cik IS NOT NULL
                    AND NOT regexp_matches(coalesce(name, ''), '{NOT_STOCK_NAME_RE}')
@@ -508,11 +513,14 @@ def check(db: str = REFERENCE, edgar_db: str = EDGAR, n: int = 200, seed: int = 
     return df
 
 
+SHORT_NAME = 5  # from market_move.ticker_from_text
+
+
 PRIORITY = "CASE m.event_type WHEN 'earnings' THEN 0 WHEN 'acquisition_target' THEN 1 ELSE 2 END"
 
 
 def fill(db: str = REFERENCE, edgar_db: str = EDGAR, types: list[str] | None = None, sec=None,
-         limit: int | None = None, finra_db: str = FINRA, retry: bool = False) -> None:
+         limit: int | None = None, finra_db: str = FINRA, retry: bool = False, redo_short: bool = False) -> None:
     """ref.ticker_supplement: a press-release ticker for each company-year that has events without one.
     retry=True looks again at company-years that came back without a ticker (not at conflicts)."""
     sec = sec or _sec()
@@ -525,6 +533,16 @@ def fill(db: str = REFERENCE, edgar_db: str = EDGAR, types: list[str] | None = N
         con.execute("DELETE FROM ref.ticker_supplement WHERE ticker IS NULL")
         print(f"Retrying {n} company-years that had no ticker")
     attach(con, edgar_db, finra_db)
+    if redo_short:  # press-release tickers found for companies with a short name, under the old 150-character window
+        from insider_screen.match import normalize
+        rows = con.execute(f"""SELECT s.cik, s.year, {_names_sql(con)} FROM ref.ticker_supplement s
+                               JOIN edgar.raw.edgar_companies c USING (cik)
+                               WHERE s.ticker IS NOT NULL AND s.how LIKE 'ticker next to%'""").fetchall()
+        short = [(cik, year) for cik, year, ns in rows
+                 if any(0 < len(normalize(n)) < SHORT_NAME for n in str(ns).split("|"))]
+        for cik, year in short:
+            con.execute("DELETE FROM ref.ticker_supplement WHERE cik = ? AND year = ?", [cik, year])
+        print(f"Redoing {len(short)} company-years whose press-release ticker came from a short company name")
     mapped = ticker_on_sql(con, "edgar.events.announcements")
     # --types picks company-years with such an event; every event's 8-K that year is a candidate
     type_filter = f"HAVING bool_or(m.event_type IN ({', '.join(repr(t) for t in types)}))" if types else ""
@@ -592,6 +610,8 @@ def main() -> None:
     f.add_argument("--types", nargs="*", help="event types, e.g. acquisition_target earnings")
     f.add_argument("--limit", type=int)
     f.add_argument("--retry", action="store_true", help="look again at company-years that had no ticker")
+    f.add_argument("--redo-short", action="store_true",
+                   help="look again at press-release tickers found for companies with a short name")
     n = sub.add_parser("names", help="match company-years without a ticker to map rows that have no CIK")
     n.add_argument("--db", default=REFERENCE)
     n.add_argument("--edgar-db", default=EDGAR)
@@ -606,7 +626,7 @@ def main() -> None:
     elif a.cmd == "check":
         check(a.db, a.edgar_db, a.n, out=a.out)
     elif a.cmd == "fill":
-        fill(a.db, a.edgar_db, a.types, limit=a.limit, retry=a.retry)
+        fill(a.db, a.edgar_db, a.types, limit=a.limit, retry=a.retry, redo_short=a.redo_short)
     elif a.cmd == "names":
         names(a.db, a.edgar_db)
     elif a.cmd == "misses":

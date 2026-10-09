@@ -32,6 +32,8 @@ THRESHOLD = 0.05
 VOLUME_X = 5
 PERSIST = 15
 BASELINE_SESSIONS = 10
+SHORT_NAME = 5  # normalized company names shorter than this need to sit right before the ticker
+SHORT_WINDOW = 40  # characters before "(EXCHANGE: TICKER)" searched for a short name
 WINDOW_SESSIONS = 2  # sessions before day 0 searched for an earlier move
 OPEN, CLOSE = time(9, 30), time(16, 0)
 
@@ -54,8 +56,14 @@ def ticker_from_text(text: str, company: str) -> tuple[str | None, str]:
         return None, "no ticker in the press release"
     if not names:
         return None, f"tickers {sorted({t for t, _ in hits})} but no company name to match"
-    scored = sorted(((max(fuzz.partial_ratio(n, normalize(before)) for n in names), t) for t, before in hits),
-                    reverse=True)
+    def score(n: str, before: str) -> float:
+        # a short name ("phh", "gtx") turns up anywhere in 150 characters (PHH Corp's release named its
+        # partner "Realogy (NYSE: RLGY)" a sentence after "PHH"), so it must sit right before the ticker
+        if len(n) < SHORT_NAME:
+            return 100.0 if re.search(rf"\b{re.escape(n)}\b", normalize(before[-SHORT_WINDOW:])) else 0.0
+        return fuzz.partial_ratio(n, normalize(before))
+
+    scored = sorted(((max(score(n, before) for n in names), t) for t, before in hits), reverse=True)
     best, ticker = scored[0]
     if best >= 80:
         return ticker, f"ticker next to the company name (match {best:.0f})"

@@ -464,3 +464,24 @@ def test_misses_splits_by_edgar_listing(tmp_path):
     con.close()
     df = tk.misses(db, edgar, out=str(tmp_path / "m.csv"))
     assert dict(zip(df.cik, df.edgar_now)) == {2: "exchange_ticker", 3: "otc_ticker", 4: "no_ticker"}
+
+
+def test_short_name_must_sit_next_to_the_ticker():
+    from insider_screen.market_move import ticker_from_text
+    text = ("PHH Corporation announced today that PHH Home Loans, its joint venture with Realogy "
+            "Holdings Corp. (NYSE: RLGY), will wind down.")
+    assert ticker_from_text(text, "PHH CORP")[0] is None
+    assert ticker_from_text("PHH Corporation (NYSE: PHH) reported", "PHH CORP")[0] == "PHH"
+
+
+def test_build_drops_notes_typed_as_stock(tmp_path):
+    db = str(tmp_path / "reference.duckdb")
+    con = duckdb.connect(db)
+    tk._setup(con)
+    con.execute("""INSERT INTO raw.massive_tickers VALUES
+        ('DHCNI', 'Diversified Healthcare Trust 5.625% Senior Notes due 2042', '0001075415', 'CS', TRUE, 'XNAS', NULL, NULL, NULL, NULL, now()),
+        ('SNHVV', 'Senior Housing Properties Trust Common Shares Ex-Distribution When Issued', '0001075415', 'CS', FALSE, 'XNAS', NULL, NULL, '2020-01-02T00:00:00Z', NULL, now()),
+        ('SNH', 'Senior Housing Properties Trust', '0001075415', 'CS', FALSE, 'XNAS', NULL, NULL, '2020-01-02T00:00:00Z', NULL, now()),
+        ('ET', 'Energy Transfer LP Common Units', '0001276187', 'CS', TRUE, 'XNYS', NULL, NULL, NULL, NULL, now())""")
+    con.close()
+    assert sorted(tk.build(db).ticker) == ["ET", "SNH"]
