@@ -130,6 +130,13 @@ def apply(reference_db: str, edgar_db: str, prices_db: str, finra_db: str,
                e.ticker, e.ticker_source
         FROM ({tickers.event_tickers_sql(con)}) e JOIN edgar.raw.edgar_companies c USING (cik)
         WHERE e.event_type = 'acquisition_target'""").df()
+    has_audit = con.execute("""SELECT count(*) FROM duckdb_tables() WHERE database_name = 'edgar'
+                               AND schema_name = 'events' AND table_name = 'target_audit'""").fetchone()[0]
+    if has_audit:  # only events the target audit confirms as takeovers of the filer
+        keep = {r[0] for r in con.execute(
+            "SELECT event_id FROM edgar.events.target_audit WHERE in_target_set").fetchall()}
+        print(f"Target audit: {len(keep)} of {len(events)} target events kept")
+        events = events[events.event_id.isin(keep)]
     con.close()
     with_ticker = events[events.ticker.notna()]
     con = duckdb.connect(prices_db, read_only=True)

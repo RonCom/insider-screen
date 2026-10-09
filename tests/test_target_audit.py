@@ -33,3 +33,19 @@ def test_audit_categories(tmp_path):
     assert got == {"a1": "delisted_after", "a2": "tender_or_13e3", "a3": "spac", "a4": "unconfirmed",
                    "a5": "unconfirmed"}
     assert dict(zip(df.event_id, df.ticker_type))["a4"] == "untyped"
+    con = duckdb.connect(edgar, read_only=True)
+    kept = {r[0] for r in con.execute("SELECT event_id FROM events.target_audit WHERE in_target_set").fetchall()}
+    assert kept == {"a1", "a2"}
+
+
+def test_audit_table_and_test_symbols(tmp_path):
+    from insider_screen import tickers as tk
+    db = str(tmp_path / "reference.duckdb")
+    con = duckdb.connect(db)
+    tk._setup(con)
+    con.execute("""INSERT INTO raw.massive_tickers VALUES
+        ('NTEST.B', 'NASDAQ TEST STOCK', '0000001', NULL, FALSE, 'XNAS', NULL, NULL, '2016-06-01T00:00:00Z', NULL, now()),
+        ('CSH', 'Cash America International', '0000001', 'CS', FALSE, 'XNYS', NULL, NULL, '2016-09-01T00:00:00Z', NULL, now())""")
+    con.close()
+    out = tk.build(db)
+    assert list(out.ticker) == ["CSH"]

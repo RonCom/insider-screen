@@ -53,6 +53,8 @@ STOCK_TYPES = ("CS", "ADRC", "ADRP", "ADRS", "OS", "NYRS", "GDR")
 # kept as 'untyped' unless the name or ticker shows another kind of security.
 NOT_STOCK_NAME_RE = (r"(?i)\b(warrants?|units?|rights?|preferred|pfd|depositary shares?|notes?|debentures?|"
                      r"etf|etn|fund|index|trust preferred|subordinated|senior|%)\b|%")
+# exchange test symbols (NTEST.B was mapped to Cash America; ZVZZT, ZXZZT and the like are Nasdaq's)
+TEST_SYMBOL_RE = r"TEST|^Z[A-Z]ZZT"
 
 
 class Massive:
@@ -158,12 +160,13 @@ def build(db: str = REFERENCE) -> pd.DataFrame:
                      primary_exchange, composite_figi, CAST(TRY_CAST(delisted_utc AS TIMESTAMP) AS DATE) AS delisted
               FROM raw.massive_tickers)
             SELECT * FROM r
-            WHERE type IN ({', '.join(repr(t) for t in STOCK_TYPES)})
+            WHERE NOT regexp_matches(ticker, '{TEST_SYMBOL_RE}')
+              AND (type IN ({', '.join(repr(t) for t in STOCK_TYPES)})
                OR (type = 'untyped' AND cik IS NOT NULL
                    AND NOT regexp_matches(coalesce(name, ''), '{NOT_STOCK_NAME_RE}')
                    -- another ticker of the same company plus a warrant/unit/right suffix
                    AND NOT EXISTS (SELECT 1 FROM r b WHERE b.cik = r.cik AND b.ticker <> r.ticker
-                                   AND regexp_matches(r.ticker, '^' || regexp_escape(b.ticker) || '[.-]?(W|WS|WT|U|UN|R|RT)$')))""").df()
+                                   AND regexp_matches(r.ticker, '^' || regexp_escape(b.ticker) || '[.-]?(W|WS|WT|U|UN|R|RT)$'))))""").df()
     out = ticker_ranges(raw)
     con.execute("CREATE SCHEMA IF NOT EXISTS ref")
     con.register("out", out)

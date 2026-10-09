@@ -10,7 +10,11 @@ selling a major asset (Seres selling VOWST). Each target event is put in one cat
   delisted_after  the filer has a 25-NSE or 15-12B within DELIST_DAYS after day 0: it stopped trading
   unconfirmed     none of these: an acquirer, an asset seller, or a deal that broke
 
-and each event's day-0 ticker is listed with its type in the map, to find notes and preferred shares
+Only tender_or_13e3 and delisted_after events stay in the target set (events.target_audit.in_target_set);
+the audit's sample showed unconfirmed events are mostly acquirers paying in stock, reverse mergers into a
+listed shell, and asset sales, plus a few broken deals, which the screen loses.
+
+Each event's day-0 ticker is listed with its type in the map, to find notes and preferred shares
 picked in place of the common stock (DHCNI for Diversified Healthcare Trust).
 
 Usage:
@@ -26,7 +30,7 @@ import pandas as pd
 
 from insider_screen.db import EDGAR, FINRA, REFERENCE
 
-DELIST_DAYS = 540
+DELIST_DAYS = 730  # 540 missed ANSYS: Synopsys deal signed January 2024, closed July 2025
 TARGET_ONLY_FORMS = ("SC 14D9", "SC 13E3")
 EXIT_FORMS = ("25-NSE", "15-12B")
 
@@ -60,10 +64,17 @@ def audit(edgar_db: str = EDGAR, reference_db: str = REFERENCE, finra_db: str = 
     df.loc[df.tender_or_13e3, "category"] = "tender_or_13e3"
     df.loc[df.sic.astype(str) == "6770", "category"] = "spac"
     df["year"] = pd.to_datetime(df.day0).dt.year
+    df["in_target_set"] = df.category.isin(["tender_or_13e3", "delisted_after"])
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out, index=False)
+    con = duckdb.connect(edgar_db)
+    con.execute("CREATE SCHEMA IF NOT EXISTS events")
+    con.register("df", df[["event_id", "category", "in_target_set", "exit_date"]])
+    con.execute("CREATE OR REPLACE TABLE events.target_audit AS SELECT * FROM df")
+    con.close()
 
-    print(f"{len(df)} acquisition-target events by category (written to {out}):")
+    print(f"{len(df)} acquisition-target events by category (written to {out} and events.target_audit; "
+          f"{int(df.in_target_set.sum())} stay in the target set):")
     print(df.category.value_counts().to_string())
     print("\nBy year:")
     print(df.pivot_table(index="year", columns="category", values="event_id", aggfunc="size", fill_value=0)
