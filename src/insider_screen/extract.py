@@ -31,6 +31,7 @@ import argparse
 import json
 import os
 import re
+import time
 from datetime import date
 from typing import Literal
 
@@ -352,19 +353,28 @@ def run(db: str, model: str, limit: int | None, lrs_from: str | None = None) -> 
         todo = [t for t in todo if t[0] in keep]
     if limit:
         todo = todo[:limit]
-    print(f"{len(todo)} releases to extract with {key}")
+    print(f"{len(todo)} releases to extract with {key}", flush=True)
+    start, failed_n = time.monotonic(), 0
     with httpx.Client() as client:
         for i, (lr_no, text) in enumerate(todo, 1):
+            t0 = time.monotonic()
             try:
                 ext = call_ollama(text, model, client)
+                _record(con, (lr_no, key, True, None, ext.model_dump_json()))
+                con.execute(f"DELETE FROM {TABLE} WHERE lr_no = ? AND model = ?", [lr_no, key])
+                n_events = _insert_events(con, lr_no, key, ext, text)
+                status = f"{n_events} event{'s' if n_events != 1 else ''}"
             except (ValidationError, httpx.HTTPError, KeyError) as err:
                 _record(con, (lr_no, key, False, str(err)[:500], None))
-                continue
-            _record(con, (lr_no, key, True, None, ext.model_dump_json()))
-            con.execute(f"DELETE FROM {TABLE} WHERE lr_no = ? AND model = ?", [lr_no, key])
-            _insert_events(con, lr_no, key, ext, text)
-            if i % 25 == 0:
-                print(f"  {i}/{len(todo)}")
+                failed_n += 1
+                status = f"FAILED ({type(err).__name__})"
+            took = time.monotonic() - t0
+            elapsed = time.monotonic() - start
+            left = (len(todo) - i) * elapsed / i
+            print(f"  {i}/{len(todo)} LR {lr_no}: {status}, {took:.0f} s | average {elapsed / i:.0f} s, "
+                  f"{elapsed / 3600:.1f} h so far, about {left / 3600:.1f} h left "
+                  f"(done around {time.strftime('%a %H:%M', time.localtime(time.time() + left))})"
+                  f"{f' | {failed_n} failed' if failed_n else ''}", flush=True)
     con.execute(f"CREATE OR REPLACE VIEW extracted.traded_events AS SELECT * FROM {TABLE}")
     summary = con.execute(
         f"""SELECT count(DISTINCT lr_no) AS releases, count(*) AS events,
