@@ -147,3 +147,35 @@ def test_shock_days_in_baseline_dont_raise_the_bar():
     assert (got.day0, got.basis) == (SESS[-2], "late_8k_shift")
     plain = 3 * (f.close.pct_change() - f.spy_close.pct_change()).iloc[-251:-30].std()
     assert plain > 0.14  # the old threshold would have missed it
+
+
+def test_small_premium_on_heavy_volume_paragon28():
+    """Paragon 28's real closes and volumes, Jan 21-30 2025, after a volatile baseline (3.7% daily SD):
+    +8.7% abnormal on 24x volume the day after an after-hours deal release; 8-K after the close that day."""
+    rng = np.random.default_rng(3)
+    n = len(SESS)
+    spy = 590 * np.cumprod(1 + rng.normal(0, 0.008, n))
+    stock = 11 * np.cumprod(1 + rng.normal(0, 0.037, n) + (spy / np.roll(spy, 1) - 1) * 0)
+    vol = np.full(n, 870_000.0)
+    tail = [(11.35, 530730, 591.40), (11.69, 719200, 594.73), (11.69, 297607, 597.97), (11.62, 344903, 596.23),
+            (11.67, 360104, 587.79), (12.00, 873893, 592.85), (12.99, 20937104, 590.19), (13.03, 3764805, 593.36)]
+    for k, (c, v, sp) in enumerate(tail):
+        j = n - len(tail) + k
+        stock[j], vol[j], spy[j] = c, v, sp
+    f = pd.DataFrame({"close": stock, "spy_close": spy, "volume": vol}, index=SESS)
+    got = r.choose_day0(f, S, at(SESS[-2], "17:02"))
+    assert (got.day0, got.basis) == (SESS[-2], "late_8k_shift")
+    assert float(got.note.split("threshold ")[1].rstrip("%")) > 8.7  # the 3-SD bar alone would have missed it
+
+
+def test_heavy_volume_path_keeps_its_limits():
+    # below the 5% floor, even on 20x volume
+    assert r.choose_day0(frame({1: 0.04}, vol={1: 2e7}), S, at(SESS[-2], "17:00")).basis == "8k_no_move"
+    # volatile stock (3-SD bar ~9%): +7% on 5x volume clears neither path
+    rng = np.random.default_rng(5)
+    f = frame({1: 0.07}, vol={1: 5e6})
+    noisy = f.close.pct_change().to_numpy(copy=True)
+    noisy[1:-2] += rng.normal(0, 0.03, len(noisy) - 3)
+    noisy[-2] = 0.07 + f.spy_close.pct_change().iloc[-2]
+    f["close"] = 20 * np.cumprod(np.nan_to_num(1 + noisy, nan=1.0))
+    assert r.choose_day0(f, S, at(SESS[-2], "17:00")).basis == "8k_no_move"

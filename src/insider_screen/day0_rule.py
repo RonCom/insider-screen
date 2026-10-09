@@ -9,9 +9,12 @@ screen measures:
 - abnormal return AR = stock return - SPY return, per session; baseline sessions -250 to -31 before S
   (the 8-K day 0) give the AR's typical size and the median volume. The typical size is a robust SD
   (1.4826 x median absolute deviation), so a few shock days in the baseline year don't raise the bar;
-- a session qualifies as an announcement-sized move if |AR| >= max(THRESHOLD, SIGMAS x sd), volume
-  >= VOLUME_X x median, and the cumulative AR from it through S keeps the same sign and at least half
-  the threshold (not a one-day spike);
+- a session qualifies as an announcement-sized move if either
+    |AR| >= max(THRESHOLD, SIGMAS x sd) on volume >= VOLUME_X x median, or
+    |AR| >= THRESHOLD on volume >= HEAVY_VOLUME_X x median (a small deal premium on a volatile stock:
+    Paragon 28, +8.7% on 24x volume against an 11% 3-SD bar),
+  and the cumulative AR from it through S keeps the same sign and at least half the bar it cleared
+  (not a one-day spike);
 - day 0 moves to the acceptance day's session only if the 8-K was accepted after the close (so S is the
   next session) and that session qualifies. It moves one session at most;
 - qualifying sessions earlier in the LOOKBACK, or before an 8-K accepted during or before the session,
@@ -30,6 +33,7 @@ LOOKBACK = 2  # sessions before S searched for announcement-sized moves (flagged
 THRESHOLD = 0.05
 SIGMAS = 3
 VOLUME_X = 3
+HEAVY_VOLUME_X = 10
 BASELINE = (250, 31)  # sessions before S: from S-250 through S-31
 MIN_BASELINE = 60
 MARKET_CLOSE = time(16, 0)
@@ -68,7 +72,15 @@ def choose_day0(daily: pd.DataFrame, s: date, accepted: pd.Timestamp | None = No
         a = ar.iloc[j]
         vr = d.volume.iloc[j] / med_vol if med_vol else np.nan
         cum = (1 + ar.iloc[j:i + 1]).prod() - 1
-        ok = not pd.isna(a) and abs(a) >= thr and vr >= VOLUME_X and np.sign(cum) == np.sign(a) and abs(cum) >= thr / 2
+        if pd.isna(a) or pd.isna(vr):
+            return False, f"{d.index[j]}: no data"
+        if abs(a) >= thr and vr >= VOLUME_X:
+            bar = thr
+        elif abs(a) >= THRESHOLD and vr >= HEAVY_VOLUME_X:
+            bar = THRESHOLD
+        else:
+            return False, ""
+        ok = np.sign(cum) == np.sign(a) and abs(cum) >= bar / 2
         return ok, f"{d.index[j]}: AR {a:+.1%} on {vr:.0f}x volume, {cum:+.1%} through {s}"
 
     moves = {d.index[j]: qualifies(j) for j in range(max(0, i - LOOKBACK), i + 1)}
