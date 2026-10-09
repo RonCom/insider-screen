@@ -25,36 +25,73 @@ def frame(jumps: dict[int, float] | None = None, vol: dict[int, float] | None = 
                          "volume": volume}, index=SESS)
 
 
-def test_move_one_session_before_8k():
-    got = r.choose_day0(frame({1: 0.30}), S)
-    assert (got.day0, got.basis, got.shift) == (SESS[-2], "announcement_move", 1)
+def at(day, hhmm):
+    return pd.Timestamp(f"{day} {hhmm}")
+
+
+def test_late_8k_shifts_to_acceptance_day():
+    # news moved the stock on S-1; the 8-K was accepted after that day's close
+    got = r.choose_day0(frame({1: 0.30}), S, at(SESS[-2], "17:18"))
+    assert (got.day0, got.basis, got.shift) == (SESS[-2], "late_8k_shift", 1)
+
+
+def test_move_before_preopen_8k_is_flagged_not_used():
+    # 8-K accepted before the open on S: a big move on S-1 isn't explained by a late filing (leak or tip)
+    got = r.choose_day0(frame({1: 0.30}), S, at(S, "07:00"))
+    assert (got.day0, got.basis, got.prior_moves) == (S, "8k_no_move", [SESS[-2]])
+
+
+def test_move_two_sessions_back_never_moves_day0():
+    got = r.choose_day0(frame({2: 0.30}), S, at(SESS[-2], "17:00"))
+    assert (got.day0, got.prior_moves) == (S, [SESS[-3]])
+
+
+def test_no_acceptance_time_no_shift():
+    assert r.choose_day0(frame({1: 0.30}), S).day0 == S
 
 
 def test_move_on_8k_session_confirms():
-    got = r.choose_day0(frame({0: 0.25}), S)
+    got = r.choose_day0(frame({0: 0.25}), S, at(S, "07:00"))
     assert (got.day0, got.basis) == (S, "8k_confirmed")
 
 
 def test_no_move_keeps_8k_day0():
-    got = r.choose_day0(frame(), S)
-    assert (got.day0, got.basis) == (S, "8k_no_move")
+    assert r.choose_day0(frame(), S, at(SESS[-2], "17:00")).basis == "8k_no_move"
 
 
-def test_move_outside_lookback_ignored():
-    got = r.choose_day0(frame({3: 0.30}), S)
-    assert got.basis == "8k_no_move" and got.day0 == S
-
-
-def test_drift_and_thin_volume_dont_move_day0():
-    # pre-announcement drift: +3% a day for two days, normal volume, then the 8-K-day jump
-    got = r.choose_day0(frame({2: 0.03, 1: 0.03, 0: 0.25}, vol={2: 1e6, 1: 1e6}), S)
+def test_pre_announcement_trading_stays_in_the_window():
+    # five days of insider-style buying (+2%/day on 3x volume), then the deal; 8-K after the close on the
+    # announcement day. Day 0 moves to the announcement session; all five days stay inside days -20..-1.
+    jumps = {k: 0.02 for k in range(2, 7)} | {1: 0.30}
+    vol = {k: 3e6 for k in range(2, 7)}
+    got = r.choose_day0(frame(jumps, vol), S, at(SESS[-2], "16:45"))
+    assert got.day0 == SESS[-2]
+    window = set(SESS[-2 - 20:-2])
+    assert {SESS[-1 - k] for k in range(2, 7)} <= window
+    # same buying with the 8-K before the open: day 0 stays on the 8-K session
+    got = r.choose_day0(frame(jumps | {1: 0.0, 0: 0.30}, vol), S, at(S, "07:00"))
     assert (got.day0, got.basis) == (S, "8k_confirmed")
-    # a big move on ordinary volume
-    assert r.choose_day0(frame({1: 0.30}, vol={1: 1.2e6}), S).basis == "8k_no_move"
+
+
+def test_day0_only_ever_moves_to_the_acceptance_day():
+    rng = np.random.default_rng(7)
+    for seed in range(60):
+        k = int(rng.integers(0, 4))
+        jumps = {k: float(rng.choice([0.3, -0.3, 0.06, 0.02]))}
+        acc = at(SESS[-1 - int(rng.integers(0, 3))], rng.choice(["07:00", "12:00", "16:30", "19:00"]))
+        got = r.choose_day0(frame(jumps, seed=seed), S, acc)
+        assert got.shift in (0, 1)
+        assert got.day0 == S or (got.day0 == acc.date() and acc.hour >= 16 and got.day0 == SESS[-2])
+
+
+def test_drift_and_thin_volume_dont_qualify():
+    got = r.choose_day0(frame({2: 0.03, 1: 0.03, 0: 0.25}, vol={2: 1e6, 1: 1e6}), S, at(SESS[-2], "17:00"))
+    assert (got.day0, got.basis, got.prior_moves) == (S, "8k_confirmed", [])
+    assert r.choose_day0(frame({1: 0.30}, vol={1: 1.2e6}), S, at(SESS[-2], "17:00")).basis == "8k_no_move"
 
 
 def test_reversed_spike_ignored():
-    got = r.choose_day0(frame({1: 0.30, 0: -0.25}, vol={0: 1e6}), S)
+    got = r.choose_day0(frame({1: 0.30, 0: -0.25}, vol={0: 1e6}), S, at(SESS[-2], "17:00"))
     assert got.basis == "8k_no_move"
 
 
@@ -89,8 +126,10 @@ def test_daily_command(tmp_path):
             "SPY": [bar(d, c, 1e8) for d, c in zip(sess, spy)]}, "next_page_token": None})
     api = Alpaca("k", "s", transport=httpx.MockTransport(handler), max_per_minute=100000)
     csv = tmp_path / "d.csv"
-    pd.DataFrame({"company": ["Six Flags", "No Ticker Co"], "day0": ["2023-11-02", "2023-11-02"],
-                  "ticker": ["SIX", ""], "market_move_et": ["2023-11-01 07:36", ""]}).to_csv(csv, index=False)
+    pd.DataFrame({"company": ["Six Flags", "Pre-open Co", "No Ticker Co"],
+                  "day0": ["2023-11-02"] * 3, "accepted_et": ["2023-11-01 17:18:27", "2023-11-02 07:00:00", ""],
+                  "ticker": ["SIX", "SIX", ""], "market_move_et": ["2023-11-01 07:36", "", ""]}).to_csv(csv, index=False)
     out = day0check.daily(str(csv), api=api, cal=cal)
-    assert out.day0_daily.tolist() == ["2023-11-01", ""]
-    assert out.day0_daily_basis.tolist() == ["announcement_move", ""]
+    assert out.day0_daily.tolist() == ["2023-11-01", "2023-11-02", ""]
+    assert out.day0_daily_basis.tolist() == ["late_8k_shift", "8k_no_move", ""]
+    assert out.prior_moves.tolist() == ["", "2023-11-01", ""]

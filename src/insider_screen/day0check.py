@@ -151,20 +151,22 @@ def daily(csv: str, api=None, cal=None) -> pd.DataFrame:
         api = Alpaca(key, secret)
     cal = cal or xc.get_calendar("XNYS", start="2015-01-01")
     df = pd.read_csv(csv, dtype=str, encoding="utf-8-sig").fillna("")
-    for col in ("ticker", "market_move_et", "day0_daily", "day0_daily_basis", "day0_daily_note"):
+    for col in ("ticker", "market_move_et", "day0_daily", "day0_daily_basis", "day0_daily_note", "prior_moves"):
         if col not in df:
             df[col] = ""
     for i, row in df.iterrows():
         t = row.ticker.strip()
         if not t:
-            df.loc[i, ["day0_daily", "day0_daily_basis", "day0_daily_note"]] = ["", "", "no ticker"]
+            df.loc[i, ["day0_daily", "day0_daily_basis", "day0_daily_note", "prior_moves"]] = ["", "", "no ticker", ""]
             continue
         s = pd.Timestamp(row.day0).date()
         start = (pd.Timestamp(s) - pd.Timedelta(days=420)).date().isoformat()
         try:
             bars = fetch_bars(api, [t, "SPY"], start, s.isoformat(), "all")
-            r = day0_rule.choose_day0(day0_rule.daily_frame(bars, t), s)
-            df.loc[i, ["day0_daily", "day0_daily_basis", "day0_daily_note"]] = [str(r.day0), r.basis, r.note]
+            accepted = pd.Timestamp(row.accepted_et) if row.get("accepted_et", "") else None
+            r = day0_rule.choose_day0(day0_rule.daily_frame(bars, t), s, accepted)
+            df.loc[i, ["day0_daily", "day0_daily_basis", "day0_daily_note", "prior_moves"]] = [
+                str(r.day0), r.basis, r.note, "|".join(map(str, r.prior_moves))]
         except Exception as err:  # one bad row shouldn't stop the run
             df.loc[i, ["day0_daily", "day0_daily_basis", "day0_daily_note"]] = ["", "", f"failed: {err}"[:200]]
         print(f"  {row.company[:40]} ({t}): {df.at[i, 'day0_daily_basis'] or df.at[i, 'day0_daily_note']} "
@@ -174,6 +176,10 @@ def daily(csv: str, api=None, cal=None) -> pd.DataFrame:
     done = df[df.day0_daily != ""]
     print(f"\n{len(done)} of {len(df)} rows have a daily-rule day 0")
     print(done.day0_daily_basis.value_counts().to_string())
+    flagged = done[done.prior_moves != ""]
+    if len(flagged):
+        print(f"\n{len(flagged)} with announcement-sized moves before day 0, left in the pre-event window:")
+        print(flagged[["company", "accepted_et", "day0_daily", "prior_moves"]].to_string(index=False))
     moved = done[done.market_move_et != ""]
     if len(moved):
         mm_day0 = day0(pd.to_datetime(moved.market_move_et), cal).dt.date.astype(str)
