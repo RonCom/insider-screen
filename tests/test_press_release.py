@@ -177,3 +177,20 @@ def test_only_submission_pages_covering_the_date_are_fetched():
     df = pr._filings(sec, 1, date(2019, 6, 10))
     assert df.accessionNumber.tolist() == ["0000000001-19-000001"]
     assert not any("submissions-002" in u for u in sec.urls)
+
+
+def test_timeouts_are_logged_not_fatal():
+    import httpx
+
+    class Slow(Fake):
+        def get(self, url, use_cache=True, store=True):
+            if "prnewswire.com/search" in url:
+                raise httpx.ReadTimeout("The read operation timed out")
+            return super().get(url, use_cache, store)
+    sec = Fake({INDEX_URL: INDEX, EXHIBIT_URL: EXHIBIT})
+    web = Slow({"https://html.duckduckgo.com/html/": DDG, ARTICLE_URL: ARTICLE})
+    got = pr.find_release(sec, web, INDEX_URL)
+    assert got["press_release_et"] == "2023-11-02 06:00"  # fell through to DuckDuckGo
+    web = Slow({})
+    got = pr.find_release(sec, web, INDEX_URL)
+    assert got["press_release_et"] == "" and "www.prnewswire.com ReadTimeout" in got["notes"]

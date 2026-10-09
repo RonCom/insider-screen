@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import date
 from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
 
+import httpx
 import pandas as pd
 from bs4 import BeautifulSoup
 from rapidfuzz import fuzz
@@ -24,6 +25,11 @@ from rapidfuzz import fuzz
 EASTERN = "America/New_York"
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/124.0 Safari/537.36")
+BROWSER_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Upgrade-Insecure-Requests": "1",
+}
 MIN_TITLE_SCORE = 75
 
 # wire name -> (site domains, dateline marker)
@@ -237,6 +243,15 @@ def on_wire(url: str, domains: tuple[str, ...] = ALL_DOMAINS) -> bool:
     return any(host == d or host.endswith("." + d) for d in domains)
 
 
+def _get(client, url: str, **kw) -> tuple[int | str, bytes]:
+    """client.get that never raises: a timeout or dropped connection comes back as the error's name
+    (e.g. 'ReadTimeout') in place of a status code, so one slow site doesn't end the lookup."""
+    try:
+        return client.get(url, **kw)
+    except httpx.HTTPError as err:
+        return f"{urlparse(url).netloc} {type(err).__name__}", b""
+
+
 SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
 INDEX_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{folder}/{acc}-index.htm"
 DOC_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{folder}/{doc}"
@@ -246,7 +261,7 @@ RELATED_FORMS = {"8-K", "425", "DEFA14A", "SC14D9C", "SC 14D9-C", "SC TO-C", "8-
 def _filings(sec, cik: int, day: date | None = None) -> pd.DataFrame:
     """A filer's filings from the submissions API. Older filings sit on extra pages, each covering a date
     range; only the pages covering `day` are fetched (long-time filers have many, megabytes each)."""
-    status, body = sec.get(SUBMISSIONS_URL.format(cik=cik))
+    status, body = _get(sec, SUBMISSIONS_URL.format(cik=cik))
     if status != 200:
         return pd.DataFrame()
     data = json.loads(body)
@@ -256,7 +271,7 @@ def _filings(sec, cik: int, day: date | None = None) -> pd.DataFrame:
         if day is not None and lo and hi and not (pd.Timestamp(lo).date() <= day <= pd.Timestamp(hi).date()
                                                   + pd.Timedelta(days=1)):
             continue
-        st, b = sec.get("https://data.sec.gov/submissions/" + f["name"])
+        st, b = _get(sec, "https://data.sec.gov/submissions/" + f["name"])
         if st == 200:
             blocks.append(json.loads(b))
     cols = ["accessionNumber", "filingDate", "form", "primaryDocument"]
@@ -277,7 +292,7 @@ def related_documents(sec, cik: int, accession: str, day: date) -> list[str]:
     for acc, form, doc in near[["accessionNumber", "form", "primaryDocument"]].itertuples(index=False):
         folder = acc.replace("-", "")
         idx = INDEX_URL.format(cik=cik, folder=folder, acc=acc)
-        st, body = sec.get(idx)
+        st, body = _get(sec, idx)
         ex = exhibit_url(body, idx) if st == 200 else None
         if ex:
             out.append(ex)
@@ -299,7 +314,7 @@ def _candidates(web, wire: str | None, headline: str) -> tuple[list[str], list[s
     wires = [wire] if wire in SITE_SEARCH else ([] if wire else list(SITE_SEARCH))
     for w in wires:
         url = site_search_url(w, q)
-        status, page = web.get(url, use_cache=False, store=False)
+        status, page = _get(web, url, use_cache=False, store=False)
         found = article_links(page, url, SITE_SEARCH[w][1]) if status == 200 else []
         log.append(f"{w} search {status}: {len(found)} links")
         urls += [u for u in found if u not in urls]
@@ -309,7 +324,7 @@ def _candidates(web, wire: str | None, headline: str) -> tuple[list[str], list[s
     site = " OR ".join(f"site:{d}" for d in domains)
     for name, url in (("DuckDuckGo", ddg_url(f'"{headline[:150]}" {site}')),
                       ("Bing", bing_url(f'"{headline[:150]}" {site}'))):
-        status, page = web.get(url, use_cache=False, store=False)
+        status, page = _get(web, url, use_cache=False, store=False)
         found = [u for u in search_urls(page) if on_wire(u, domains)] if status == 200 else []
         log.append(f"{name} {status}: {len(found)} links")
         urls += [u for u in found if u not in urls]
@@ -320,7 +335,7 @@ def _candidates(web, wire: str | None, headline: str) -> tuple[list[str], list[s
 
 def _check_page(web, url: str, headline: str, dl_date: date | None, filed: date | None):
     """(time, how, title score) if the page passes, else (None, reason, score)."""
-    status, page = web.get(url)
+    status, page = _get(web, url)
     if status != 200:
         return None, f"page {status}", 0
     t, how = page_time(page)
@@ -347,7 +362,7 @@ def find_release(sec, web, index_url: str, filed: date | None = None, max_candid
     def blank(note: str) -> dict:
         return {"press_release_et": "", "press_release_source": "", "notes": note}
 
-    status, body = sec.get(index_url)
+    status, body = _get(sec, index_url)
     if status != 200:
         return blank(f"filing index returned {status}")
     docs = [u for u in [exhibit_url(body, index_url)] if u]
@@ -357,7 +372,7 @@ def find_release(sec, web, index_url: str, filed: date | None = None, max_candid
     if not docs:
         return blank("no EX-99 exhibit in this 8-K and no press release filed the same or next day")
     for doc in docs:
-        status, ex_body = sec.get(doc)
+        status, ex_body = _get(sec, doc)
         if status != 200:
             continue
         wire, dl_date, headline = read_exhibit(exhibit_text(ex_body))

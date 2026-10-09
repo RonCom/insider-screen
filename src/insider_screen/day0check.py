@@ -60,14 +60,18 @@ def sample(db: str, out: str, n: int = N, seed: int = 42, start: str = "2017-01-
     return df
 
 
-def fill(csv: str, sec=None, web=None) -> pd.DataFrame:
+def fill(csv: str, sec=None, web=None, limit: int | None = None) -> pd.DataFrame:
     """Fill press_release_et, press_release_source and notes for rows left blank. Saves after each row."""
     sec = sec or PoliteClient(cache_dir="data/cache/sec", user_agent=DEFAULT_USER_AGENT, max_per_second=5)
     # newswires and search engines: give up fast on a blocked or hanging site (one retry, 15 s timeout)
     web = web or PoliteClient(cache_dir="data/cache/press", user_agent=press_release.BROWSER_UA,
                               max_per_second=1.0, max_retries=1, timeout=15.0)
+    if hasattr(web, "client"):  # headers a browser sends; some bot filters stall requests without them
+        web.client.headers.update(press_release.BROWSER_HEADERS)
     df = pd.read_csv(csv, dtype=str, encoding="utf-8-sig").fillna("")
     todo = df.index[df.press_release_et.str.strip() == ""]
+    if limit:
+        todo = todo[:limit]
     print(f"{len(todo)} of {len(df)} rows to look up")
     started = time.monotonic()
     for n, i in enumerate(todo, 1):
@@ -126,13 +130,14 @@ def main() -> None:
     s.add_argument("--n", type=int, default=N)
     f = sub.add_parser("fill")
     f.add_argument("--csv", default="data/day0_check.csv")
+    f.add_argument("--limit", type=int, help="Look up only this many blank rows (for a quick test)")
     c = sub.add_parser("score")
     c.add_argument("--csv", default="data/day0_check.csv")
     a = ap.parse_args()
     if a.cmd == "sample":
         sample(a.db, a.out, a.n)
     elif a.cmd == "fill":
-        fill(a.csv)
+        fill(a.csv, limit=a.limit)
     else:
         score(a.csv)
 
