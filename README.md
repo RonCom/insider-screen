@@ -120,4 +120,5 @@ uv run python -m insider_screen.day0check fill     # looks up each 8-K's press r
                                                    # resumable; unresolved rows get a note and a search link
 uv run python -m insider_screen.day0check market   # first abnormal minute-bar move per event (Alpaca keys in .env)
 uv run python -m insider_screen.day0check score --column market_move_et
+uv run python -m insider_screen.day0check daily    # daily-bar day-0 rule on the sample, compared with the minute check
 ```

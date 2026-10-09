@@ -10,6 +10,7 @@ Usage:
     uv run python -m insider_screen.day0check score
     uv run python -m insider_screen.day0check market      # first market move per event (market_move.py)
     uv run python -m insider_screen.day0check score --column market_move_et
+    uv run python -m insider_screen.day0check daily       # the daily-bar day-0 rule (day0_rule.py) on the sample
 
 In the CSV, fill press_release_et with the release's date and Eastern time ("2021-06-16 07:00"),
 press_release_source with the URL you took it from, and notes as needed. Leave press_release_et
@@ -136,6 +137,53 @@ def market(csv: str, api=None, sec=None, cal=None) -> pd.DataFrame:
     return df
 
 
+def daily(csv: str, api=None, cal=None) -> pd.DataFrame:
+    """Apply the daily-bar day-0 rule to each row with a ticker; write day0_daily, day0_daily_basis,
+    day0_daily_note, and compare with the minute-bar check where it found a move."""
+    import os
+
+    from insider_screen import day0_rule
+    from insider_screen.prices import Alpaca, fetch_bars
+    if api is None:
+        key, secret = os.environ.get("ALPACA_API_KEY_ID"), os.environ.get("ALPACA_API_SECRET_KEY")
+        if not key or not secret:
+            raise SystemExit("Set ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY (in .env)")
+        api = Alpaca(key, secret)
+    cal = cal or xc.get_calendar("XNYS", start="2015-01-01")
+    df = pd.read_csv(csv, dtype=str, encoding="utf-8-sig").fillna("")
+    for col in ("ticker", "market_move_et", "day0_daily", "day0_daily_basis", "day0_daily_note"):
+        if col not in df:
+            df[col] = ""
+    for i, row in df.iterrows():
+        t = row.ticker.strip()
+        if not t:
+            df.loc[i, ["day0_daily", "day0_daily_basis", "day0_daily_note"]] = ["", "", "no ticker"]
+            continue
+        s = pd.Timestamp(row.day0).date()
+        start = (pd.Timestamp(s) - pd.Timedelta(days=420)).date().isoformat()
+        try:
+            bars = fetch_bars(api, [t, "SPY"], start, s.isoformat(), "all")
+            r = day0_rule.choose_day0(day0_rule.daily_frame(bars, t), s)
+            df.loc[i, ["day0_daily", "day0_daily_basis", "day0_daily_note"]] = [str(r.day0), r.basis, r.note]
+        except Exception as err:  # one bad row shouldn't stop the run
+            df.loc[i, ["day0_daily", "day0_daily_basis", "day0_daily_note"]] = ["", "", f"failed: {err}"[:200]]
+        print(f"  {row.company[:40]} ({t}): {df.at[i, 'day0_daily_basis'] or df.at[i, 'day0_daily_note']} "
+              f"{df.at[i, 'day0_daily']}")
+    df.to_csv(csv, index=False, encoding="utf-8-sig")
+
+    done = df[df.day0_daily != ""]
+    print(f"\n{len(done)} of {len(df)} rows have a daily-rule day 0")
+    print(done.day0_daily_basis.value_counts().to_string())
+    moved = done[done.market_move_et != ""]
+    if len(moved):
+        mm_day0 = day0(pd.to_datetime(moved.market_move_et), cal).dt.date.astype(str)
+        agree = (mm_day0.values == moved.day0_daily.values)
+        print(f"\nAgainst the minute-bar check ({len(moved)} rows with a market move): {agree.sum()} agree")
+        out = moved.assign(minute_day0=mm_day0.values, agree=agree)
+        print(out[["company", "day0", "minute_day0", "day0_daily", "day0_daily_basis", "agree"]].to_string(index=False))
+    return df
+
+
 def score(csv: str, column: str = "press_release_et") -> pd.DataFrame:
     df = pd.read_csv(csv, dtype=str, encoding="utf-8-sig").fillna("")
     if column not in df:
@@ -182,6 +230,8 @@ def main() -> None:
     f.add_argument("--limit", type=int, help="Look up only this many blank rows (for a quick test)")
     m = sub.add_parser("market")
     m.add_argument("--csv", default="data/day0_check.csv")
+    dl = sub.add_parser("daily")
+    dl.add_argument("--csv", default="data/day0_check.csv")
     c = sub.add_parser("score")
     c.add_argument("--csv", default="data/day0_check.csv")
     c.add_argument("--column", default="press_release_et", help="press_release_et or market_move_et")
@@ -192,6 +242,8 @@ def main() -> None:
         fill(a.csv, limit=a.limit)
     elif a.cmd == "market":
         market(a.csv)
+    elif a.cmd == "daily":
+        daily(a.csv)
     else:
         score(a.csv, a.column)
 
