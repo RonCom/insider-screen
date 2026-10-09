@@ -394,6 +394,42 @@ def names(db: str = REFERENCE, edgar_db: str = EDGAR, finra_db: str = FINRA) -> 
     return pd.DataFrame(rows, columns=["cik", "year", "ticker", "conflict", "accession", "how"])
 
 
+EXCHANGES = ("NYSE", "Nasdaq", "CBOE", "NYSE American", "NYSE Arca", "NYSE MKT", "BATS")
+
+
+def misses(db: str = REFERENCE, edgar_db: str = EDGAR, finra_db: str = FINRA,
+           out: str = "data/ticker_misses.csv") -> pd.DataFrame:
+    """Events still without a ticker, split by what EDGAR's company record lists today:
+    exchange_ticker  - a ticker on a national exchange (listed now, so very likely listed then: fixable),
+    otc_ticker       - only OTC tickers (the screen uses exchange-listed stocks),
+    no_ticker        - none (delisted, merged away, or never listed: non-traded funds, subsidiaries).
+    Writes the companies with the most missed events, with EDGAR's tickers, to `out`."""
+    con = duckdb.connect(db, read_only=True)
+    attach(con, edgar_db, finra_db)
+    sql = event_tickers_sql(con)
+    ex = " OR ".join(f"list_contains(string_split(coalesce(c.exchanges, ''), '|'), '{x}')" for x in EXCHANGES)
+    df = con.execute(f"""
+        SELECT e.event_type, e.cik, c.name, c.entity_type, c.sic, c.tickers, c.exchanges, e.day0,
+               CASE WHEN {ex} THEN 'exchange_ticker'
+                    WHEN coalesce(c.tickers, '') <> '' THEN 'otc_ticker' ELSE 'no_ticker' END AS edgar_now
+        FROM ({sql}) e JOIN edgar.raw.edgar_companies c USING (cik)
+        WHERE e.ticker IS NULL""").df()
+    con.close()
+    summary = df.pivot_table(index="event_type", columns="edgar_now", values="cik", aggfunc="size", fill_value=0)
+    print("Events without a ticker, by what EDGAR lists for the company today:")
+    print(summary.to_string())
+    top = (df.groupby(["cik", "name", "edgar_now", "tickers", "exchanges", "sic"], dropna=False)
+             .agg(events=("day0", "size"), first=("day0", "min"), last=("day0", "max"),
+                  targets=("event_type", lambda s: int((s == "acquisition_target").sum())))
+             .reset_index().sort_values("events", ascending=False))
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    top.to_csv(out, index=False)
+    print(f"\n{len(top)} companies; listed by missed events in {out}. Top 15 with an exchange ticker today:")
+    print(top[top.edgar_now == "exchange_ticker"].head(15)[["cik", "name", "tickers", "events", "first", "last"]]
+          .to_string(index=False))
+    return df
+
+
 def _sec():
     from insider_screen.http import DEFAULT_USER_AGENT, PoliteClient
     return PoliteClient(cache_dir="data/cache/sec", user_agent=DEFAULT_USER_AGENT, max_per_second=5)
@@ -536,6 +572,9 @@ def main() -> None:
     d.add_argument("--db", default=REFERENCE)
     b = sub.add_parser("build")
     b.add_argument("--db", default=REFERENCE)
+    ms = sub.add_parser("misses", help="events without a ticker, split by EDGAR's current listing")
+    ms.add_argument("--db", default=REFERENCE)
+    ms.add_argument("--edgar-db", default=EDGAR)
     c = sub.add_parser("coverage")
     c.add_argument("--db", default=REFERENCE)
     c.add_argument("--edgar-db", default=EDGAR)
@@ -567,6 +606,8 @@ def main() -> None:
         fill(a.db, a.edgar_db, a.types, limit=a.limit, retry=a.retry)
     elif a.cmd == "names":
         names(a.db, a.edgar_db)
+    elif a.cmd == "misses":
+        misses(a.db, a.edgar_db)
     else:
         coverage(a.db, a.edgar_db)
 

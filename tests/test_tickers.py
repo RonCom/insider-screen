@@ -442,3 +442,25 @@ def test_names_needs_finra_volume_and_long_names(tmp_path):
     out = tk.names(db, edgar, finra)
     # FSKR only traded from 2020; "gtx" is too short to trust across CIKs; TRCB traded the month before
     assert list(zip(out.cik, out.ticker)) == [(1343034, "TRCB")]
+
+
+def test_misses_splits_by_edgar_listing(tmp_path):
+    db, edgar = str(tmp_path / "reference.duckdb"), str(tmp_path / "edgar.duckdb")
+    con = duckdb.connect(db)
+    con.execute("CREATE SCHEMA ref")
+    con.execute("""CREATE TABLE ref.ticker_cik AS SELECT 'AAA' AS ticker, 1::BIGINT AS cik, 'A' AS name, 'CS' AS type,
+                   NULL::DATE AS valid_from, NULL::DATE AS valid_to""")
+    con.close()
+    con = duckdb.connect(edgar)
+    con.execute("CREATE SCHEMA events; CREATE SCHEMA raw")
+    con.execute("""CREATE TABLE raw.edgar_companies AS SELECT * FROM (VALUES
+        (1, 'A Corp', 'operating', '1000', 'AAA', 'NYSE'), (2, 'B Corp', 'operating', '1000', 'BBB', 'Nasdaq'),
+        (3, 'C Corp', 'operating', '1000', 'CCCC', 'OTC'), (4, 'D Sub LLC', 'operating', '4911', '', ''))
+        t(cik, name, entity_type, sic, tickers, exchanges)""")
+    con.execute("""CREATE TABLE events.announcements AS SELECT * FROM (VALUES
+        ('a', 1, 'earnings', TIMESTAMP '2020-01-01'), ('b', 2, 'earnings', TIMESTAMP '2020-01-01'),
+        ('c', 3, 'earnings', TIMESTAMP '2020-01-01'), ('d', 4, 'acquisition_target', TIMESTAMP '2020-01-01'))
+        t(event_id, cik, event_type, day0)""")
+    con.close()
+    df = tk.misses(db, edgar, out=str(tmp_path / "m.csv"))
+    assert dict(zip(df.cik, df.edgar_now)) == {2: "exchange_ticker", 3: "otc_ticker", 4: "no_ticker"}
