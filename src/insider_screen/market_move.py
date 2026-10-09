@@ -35,9 +35,11 @@ BASELINE_SESSIONS = 10
 WINDOW_SESSIONS = 2  # sessions before day 0 searched for an earlier move
 OPEN, CLOSE = time(9, 30), time(16, 0)
 
+# "(NYSE: SIX)", "(Nasdaq: FIT)", "(NASDAQ Capital Market: XXX)", "(NYSE American: XXX)", "(NasdaqGS: XXX)".
+# The exchange name is matched in any case; the ticker only in capitals.
 TICKER_RE = re.compile(
-    r"\(?\b(?:NYSE(?:\s+(?:American|Arca|MKT))?|NASDAQ(?:\s*(?:GS|GM|CM|Global(?:\s+Select)?(?:\s+Market)?))?"
-    r"|Nasdaq(?:\s*(?:GS|GM|CM))?|AMEX|NYSE\s*American)\s*:\s*\"?([A-Z]{1,5}(?:\.[A-Z])?)\b", re.I)
+    r"\(?\b(?:NYSE|NASDAQ|AMEX)(?:[\s-]*(?:American|Arca|MKT|Global|Select|Capital|Stock|Market|GS|GM|CM)){0,4}"
+    r"\s*:\s*\"?(?-i:([A-Z]{1,5}(?:\.[A-Z])?))\b", re.I)
 
 
 def ticker_from_text(text: str, company: str) -> tuple[str | None, str]:
@@ -51,7 +53,7 @@ def ticker_from_text(text: str, company: str) -> tuple[str | None, str]:
     best, ticker = scored[0]
     if best >= 80:
         return ticker, f"ticker next to the company name (match {best:.0f})"
-    return None, f"tickers {sorted({t for _, t in hits})} but none next to '{company}'"
+    return None, f"tickers {sorted({t for t, _ in hits})} but none next to '{company}'"
 
 
 def fetch_minutes(api: Alpaca, symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
@@ -130,12 +132,15 @@ def release_ticker(sec, index_url: str, filed: date | None, company: str) -> tup
     if filed is not None:
         cik, acc = press_release._accession_cik(index_url)
         docs += press_release.related_documents(sec, cik, acc, filed)
+    docs += [u for u in [press_release.primary_doc_url(body, index_url)] if u and u not in docs]
     why = "no press release in this 8-K or same-day filings"
     for doc in docs:
         status, ex = press_release._get(sec, doc)
         if status != 200:
             continue
-        ticker, why = ticker_from_text(press_release.exhibit_text(ex), company)
+        ticker, reason = ticker_from_text(press_release.exhibit_text(ex), company)
         if ticker:
-            return ticker, f"{why}; {doc}"
+            return ticker, f"{reason}; {doc}"
+        if reason != "no ticker in the press release" or why.startswith("no press release"):
+            why = reason  # keep the most informative reason across documents
     return None, why

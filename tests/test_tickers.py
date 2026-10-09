@@ -141,7 +141,7 @@ def _edgar(tmp_path):
     con.execute("CREATE SCHEMA events; CREATE SCHEMA raw")
     con.execute("""CREATE TABLE raw.edgar_companies AS SELECT * FROM (VALUES
         (701374, 'SIX FLAGS ENTERTAINMENT CORP'), (1326801, 'Meta Platforms, Inc.'), (555, 'Gone Corp')) t(cik, name)""")
-    con.execute("""CREATE TABLE events.announcements AS SELECT * FROM (VALUES
+    con.execute("""CREATE TABLE events.announcements AS SELECT *, day0 + INTERVAL 7 HOUR AS accepted_et FROM (VALUES
         ('e1', 701374, 'acquisition_target', TIMESTAMP '2023-11-02', '0001-23-000001'),
         ('e2', 1326801, 'earnings', TIMESTAMP '2021-07-28', '0001-21-000002'),
         ('e3', 555, 'earnings', TIMESTAMP '2018-05-01', '0001-18-000003'),
@@ -241,3 +241,40 @@ def test_attach_without_finra_warns(tmp_path, capsys):
     duckdb.connect(edgar).close()
     assert tk.attach(con, edgar, str(tmp_path / "missing.duckdb")) is False
     assert "no FINRA volume" in capsys.readouterr().out
+
+
+def test_fill_retry_and_8k_body(tmp_path):
+    """A company-year with no EX-99 is retried with --retry and found in the 8-K's own text."""
+    db = str(tmp_path / "reference.duckdb")
+    tk.download(api_with([]), db)
+    tk.build(db)
+    edgar = _edgar(tmp_path)
+    tk.fill(db, edgar, sec=FakeSec({}))  # nothing found anywhere
+    con = duckdb.connect(db)
+    assert con.execute("SELECT count(*) FROM ref.ticker_supplement WHERE ticker IS NULL").fetchone()[0] == 1
+    con.close()
+
+    class BodySec(FakeSec):
+        def get(self, url, use_cache=True, store=True):
+            self.urls.append(url)
+            if url.endswith("0001-18-000004-index.htm"):
+                return 200, (b'<table class="tableFile"><tr><th>h</th></tr><tr><td>1</td><td>x</td>'
+                             b'<td><a href="/Archives/edgar/data/555/000118000004/d8k.htm">d</a></td><td>8-K</td><td>1</td></tr></table>')
+            if url.endswith("000118000004/d8k.htm"):
+                return 200, b"<p>Gone Corp (NYSE: GONE) announced today</p>"
+            return 404, b""
+    tk.fill(db, edgar, sec=BodySec({}), retry=True)
+    con = duckdb.connect(db)
+    assert con.execute("SELECT ticker FROM ref.ticker_supplement WHERE cik = 555").fetchall() == [("GONE",)]
+
+
+def test_ticker_wordings():
+    from insider_screen.market_move import ticker_from_text
+    assert ticker_from_text("Acme Inc. (NASDAQ Capital Market: ACME) today", "ACME INC")[0] == "ACME"
+    assert ticker_from_text("Acme Inc. (NYSE American: AMX) today", "ACME INC")[0] == "AMX"
+    assert ticker_from_text("Acme Inc. (Nasdaq Global Select Market: ACMG) today", "ACME INC")[0] == "ACMG"
+    assert ticker_from_text("Acme Inc. (NasdaqGS: ACMS) today", "ACME INC")[0] == "ACMS"
+    # lowercase words after an exchange name aren't tickers
+    assert ticker_from_text("Acme Inc. listed on the NYSE: the company said", "ACME INC")[0] is None
+    # the reason lists the tickers found
+    assert "['BETA']" in ticker_from_text("Beta Corp (NYSE: BETA) will buy it", "ACME INC")[1]

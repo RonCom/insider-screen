@@ -88,6 +88,16 @@ def exhibit_url(index_html: str | bytes, index_url: str) -> str | None:
     return min(found)[1] if found else None
 
 
+def primary_doc_url(index_html: str | bytes, index_url: str) -> str | None:
+    """The filing's main document (type 8-K, 425, ...): some 8-Ks carry the announcement in their body."""
+    soup = BeautifulSoup(index_html, "lxml")
+    for tr in soup.select("table.tableFile tr"):
+        cells, link = tr.find_all("td"), tr.find("a", href=True)
+        if len(cells) >= 4 and link is not None and not cells[3].get_text(strip=True).upper().startswith("EX-"):
+            return urljoin(index_url, link["href"].replace("/ix?doc=", ""))
+    return None
+
+
 def exhibit_text(html: str | bytes) -> str:
     text = BeautifulSoup(html, "lxml").get_text("\n")
     lines = (re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines())
@@ -312,7 +322,7 @@ def related_documents(sec, cik: int, accession: str, day: date) -> list[str]:
 
 
 def _accession_cik(index_url: str) -> tuple[int, str]:
-    m = re.search(r"/data/(\d+)/\d+/(\d{10}-\d{2}-\d{6})-index", index_url)
+    m = re.search(r"/data/(\d+)/\d+/([\d-]+)-index", index_url)
     return int(m.group(1)), m.group(2)
 
 

@@ -284,10 +284,11 @@ def _index_url(cik: int, accession: str) -> str:
     return INDEX_URL.format(cik=int(cik), folder=accession.replace("-", ""), acc=accession)
 
 
-def _release_ticker(sec, cik: int, accession: str, company: str) -> tuple[str | None, str]:
+def _release_ticker(sec, cik: int, accession: str, company: str, filed=None) -> tuple[str | None, str]:
+    """Ticker from the 8-K's press release, its body, or (with `filed`) the company's other filings that day."""
     from insider_screen.market_move import release_ticker
     try:
-        return release_ticker(sec, _index_url(cik, accession), None, company)
+        return release_ticker(sec, _index_url(cik, accession), filed, company)
     except Exception as err:  # one bad filing shouldn't stop the run
         return None, f"lookup failed: {err}"[:200]
 
@@ -347,13 +348,18 @@ def check(db: str = REFERENCE, edgar_db: str = EDGAR, n: int = 200, seed: int = 
 
 
 def fill(db: str = REFERENCE, edgar_db: str = EDGAR, types: list[str] | None = None, sec=None,
-         limit: int | None = None, finra_db: str = FINRA) -> None:
-    """ref.ticker_supplement: a press-release ticker for each company-year that has events without one."""
+         limit: int | None = None, finra_db: str = FINRA, retry: bool = False) -> None:
+    """ref.ticker_supplement: a press-release ticker for each company-year that has events without one.
+    retry=True looks again at company-years that came back without a ticker (not at conflicts)."""
     sec = sec or _sec()
     con = duckdb.connect(db)
     con.execute("CREATE SCHEMA IF NOT EXISTS ref")
     con.execute("""CREATE TABLE IF NOT EXISTS ref.ticker_supplement (
         cik BIGINT, year INTEGER, ticker VARCHAR, conflict BOOLEAN, accession VARCHAR, how VARCHAR)""")
+    if retry:
+        n = con.execute("SELECT count(*) FROM ref.ticker_supplement WHERE ticker IS NULL").fetchone()[0]
+        con.execute("DELETE FROM ref.ticker_supplement WHERE ticker IS NULL")
+        print(f"Retrying {n} company-years that had no ticker")
     attach(con, edgar_db, finra_db)
     mapped = ticker_on_sql(con, "edgar.events.announcements")
     type_filter = f"AND m.event_type IN ({', '.join(repr(t) for t in types)})" if types else ""
@@ -361,7 +367,7 @@ def fill(db: str = REFERENCE, edgar_db: str = EDGAR, types: list[str] | None = N
     todo = con.execute(f"""
         WITH m AS ({mapped})
         SELECT m.cik, year(m.day0) AS year, c.name AS company, list(m.accession ORDER BY m.day0 DESC)[1:3] AS accessions,
-               max(m.day0) AS last_day0
+               list(CAST(m.accepted_et AS DATE) ORDER BY m.day0 DESC)[1:3] AS filed, max(m.day0) AS last_day0
         FROM m JOIN edgar.raw.edgar_companies c USING (cik)
         WHERE m.ticker IS NULL {type_filter}
           AND NOT EXISTS (SELECT 1 FROM ref.ticker_supplement s WHERE s.cik = m.cik AND s.year = year(m.day0))
@@ -372,8 +378,8 @@ def fill(db: str = REFERENCE, edgar_db: str = EDGAR, types: list[str] | None = N
     found = 0
     for k, r in enumerate(todo.itertuples(index=False), 1):
         ticker, how, acc = None, "no 8-K tried", None
-        for acc in r.accessions:
-            ticker, how = _release_ticker(sec, r.cik, acc, r.company)
+        for acc, filed in zip(r.accessions, r.filed):
+            ticker, how = _release_ticker(sec, r.cik, acc, r.company, filed)
             if ticker:
                 break
         conflict = False
@@ -414,6 +420,7 @@ def main() -> None:
     f.add_argument("--edgar-db", default=EDGAR)
     f.add_argument("--types", nargs="*", help="event types, e.g. acquisition_target earnings")
     f.add_argument("--limit", type=int)
+    f.add_argument("--retry", action="store_true", help="look again at company-years that had no ticker")
     a = ap.parse_args()
     if a.cmd == "download":
         key = os.environ.get("MASSIVE_API_KEY")
@@ -425,7 +432,7 @@ def main() -> None:
     elif a.cmd == "check":
         check(a.db, a.edgar_db, a.n, out=a.out)
     elif a.cmd == "fill":
-        fill(a.db, a.edgar_db, a.types, limit=a.limit)
+        fill(a.db, a.edgar_db, a.types, limit=a.limit, retry=a.retry)
     else:
         coverage(a.db, a.edgar_db)
 
