@@ -115,3 +115,80 @@ def test_all_null_dates_still_typed(tmp_path):
     assert types["valid_from"] == "DATE" and types["valid_to"] == "DATE"
     con.execute("CREATE TABLE ev AS SELECT 'e1' AS event_id, 1::BIGINT AS cik, TIMESTAMP '2023-01-05' AS day0")
     assert con.execute(tk.TICKER_ON_SQL.format(events="ev", map="ref.ticker_cik")).fetchall()[0][-1] == "AAA"
+
+
+class FakeSec:
+    """Filing index and press release per accession; the release names the given ticker."""
+    def __init__(self, releases):
+        self.releases, self.urls = releases, []
+
+    def get(self, url, use_cache=True, store=True):
+        self.urls.append(url)
+        for acc, text in self.releases.items():
+            folder = acc.replace("-", "")
+            if url.endswith(f"{acc}-index.htm"):
+                return 200, (f'<table class="tableFile"><tr><th>h</th></tr><tr><td>1</td><td>x</td>'
+                             f'<td><a href="/Archives/edgar/data/1/{folder}/ex991.htm">d</a></td><td>EX-99.1</td><td>1</td></tr>'
+                             f'</table>').encode()
+            if url.endswith(f"{folder}/ex991.htm"):
+                return 200, f"<p>{text}</p>".encode()
+        return 404, b""
+
+
+def _edgar(tmp_path):
+    edgar = str(tmp_path / "edgar.duckdb")
+    con = duckdb.connect(edgar)
+    con.execute("CREATE SCHEMA events; CREATE SCHEMA raw")
+    con.execute("""CREATE TABLE raw.edgar_companies AS SELECT * FROM (VALUES
+        (701374, 'SIX FLAGS ENTERTAINMENT CORP'), (1326801, 'Meta Platforms, Inc.'), (555, 'Gone Corp')) t(cik, name)""")
+    con.execute("""CREATE TABLE events.announcements AS SELECT * FROM (VALUES
+        ('e1', 701374, 'acquisition_target', TIMESTAMP '2023-11-02', '0001-23-000001'),
+        ('e2', 1326801, 'earnings', TIMESTAMP '2021-07-28', '0001-21-000002'),
+        ('e3', 555, 'earnings', TIMESTAMP '2018-05-01', '0001-18-000003'),
+        ('e4', 555, 'other_material_candidate', TIMESTAMP '2018-09-01', '0001-18-000004')
+        ) t(event_id, cik, event_type, day0, accession)""")
+    con.close()
+    return edgar
+
+
+def test_check_classifies(tmp_path):
+    db = str(tmp_path / "reference.duckdb")
+    tk.download(api_with([]), db)
+    tk.build(db)
+    edgar = _edgar(tmp_path)
+    sec = FakeSec({"0001-23-000001": "Six Flags Entertainment Corporation (NYSE: SIX) today announced",
+                   "0001-21-000002": "Meta Platforms, Inc. (Nasdaq: MSFT) reported"})
+    df = tk.check(db, edgar, n=6, out=str(tmp_path / "c.csv"), sec=sec)
+    got = dict(zip(df.event_id, df.outcome))
+    assert got == {"e1": "agree", "e2": "release_ticker_not_in_map"}
+
+
+def test_fill_supplements_missing_company_years(tmp_path):
+    db = str(tmp_path / "reference.duckdb")
+    tk.download(api_with([]), db)
+    tk.build(db)
+    edgar = _edgar(tmp_path)
+    sec = FakeSec({"0001-18-000004": "Gone Corp (NYSE: GONE) today announced",
+                   "0001-18-000003": "Gone Corp (NYSE: GONE) reported results"})
+    tk.fill(db, edgar, sec=sec)
+    con = duckdb.connect(db)
+    assert con.execute("SELECT cik, year, ticker, conflict FROM ref.ticker_supplement").fetchall() == [(555, 2018, "GONE", False)]
+    con.execute(f"ATTACH '{edgar}' AS edgar (READ_ONLY)")
+    rows = con.execute(f"SELECT event_id, ticker, ticker_source FROM ({tk.event_tickers_sql(con)}) ORDER BY 1").fetchall()
+    con.close()
+    assert rows == [("e1", "SIX", "map"), ("e2", "FB", "map"), ("e3", "GONE", "press_release"),
+                    ("e4", "GONE", "press_release")]
+    n = len(sec.urls)
+    tk.fill(db, edgar, sec=sec)  # done company-years aren't looked up again
+    assert len(sec.urls) == n
+
+
+def test_fill_rejects_ticker_held_by_another_company(tmp_path):
+    db = str(tmp_path / "reference.duckdb")
+    tk.download(api_with([]), db)
+    tk.build(db)
+    edgar = _edgar(tmp_path)
+    tk.fill(db, edgar, sec=FakeSec({"0001-18-000004": "Gone Corp (NYSE: CELG) today announced"}))
+    con = duckdb.connect(db)
+    row = con.execute("SELECT ticker, conflict, how FROM ref.ticker_supplement").fetchone()
+    assert row[:2] == ("CELG", True) and "Celgene" in row[2]

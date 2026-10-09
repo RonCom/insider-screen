@@ -10,7 +10,13 @@ get reused after a delisting and change when companies rename, so the map is dat
    several companies over time is split at each holder's delisting date: a holder's range ends on its
    delisting date and the next holder's starts the day after. Ranges are approximate at the edges
    (Massive gives delisting dates, not listing dates), which is why lookups go by day 0 inside a range.
-3. coverage: share of events in data/edgar.duckdb with a ticker valid on day 0, by event type and year.
+3. coverage: share of events in data/edgar.duckdb with a ticker valid on day 0, by event type and year
+   (map first, then the supplement from step 5).
+4. check: error rate of the map. For a sample of events the map covers (split evenly across event types),
+   the ticker printed next to the company's name in the 8-K's press release is compared with the map's;
+   rows go to data/ticker_check.csv.
+5. fill: for each company-year with events but no ticker, one 8-K press release supplies the ticker
+   (ref.ticker_supplement). A ticker the map gives another company on that date is rejected. Resumable.
 
 Settings (.env): MASSIVE_API_KEY; MASSIVE_API_URL (default https://api.massive.com; the older
 https://api.polygon.io is tried if that host doesn't answer).
@@ -19,6 +25,8 @@ Usage:
     uv run python -m insider_screen.tickers download
     uv run python -m insider_screen.tickers build
     uv run python -m insider_screen.tickers coverage
+    uv run python -m insider_screen.tickers check --n 200
+    uv run python -m insider_screen.tickers fill --types acquisition_target
 """
 
 from __future__ import annotations
@@ -206,11 +214,27 @@ TICKER_ON_SQL = """
 """
 
 
+def event_tickers_sql(con: duckdb.DuckDBPyConnection, events: str = "edgar.events.announcements") -> str:
+    """SQL for events with their ticker on day 0: the map first, else the press-release supplement for
+    that company and year (when the supplement table exists). Adds columns ticker and ticker_source."""
+    mapped = TICKER_ON_SQL.format(events=events, map="ref.ticker_cik")
+    has_supp = con.execute("""SELECT count(*) FROM duckdb_tables()
+                              WHERE schema_name = 'ref' AND table_name = 'ticker_supplement'""").fetchone()[0]
+    if not has_supp:
+        return f"SELECT m.*, CASE WHEN m.ticker IS NOT NULL THEN 'map' END AS ticker_source FROM ({mapped}) m"
+    return f"""SELECT m.* EXCLUDE (ticker), coalesce(m.ticker, s.ticker) AS ticker,
+                      CASE WHEN m.ticker IS NOT NULL THEN 'map' WHEN s.ticker IS NOT NULL THEN 'press_release' END
+                        AS ticker_source
+               FROM ({mapped}) m
+               LEFT JOIN ref.ticker_supplement s
+                 ON s.cik = m.cik AND s.year = year(m.day0) AND s.ticker IS NOT NULL AND NOT s.conflict"""
+
+
 def coverage(db: str = REFERENCE, edgar_db: str = EDGAR) -> pd.DataFrame:
     """Share of events with a ticker valid on day 0, by event type and year."""
     con = duckdb.connect(db, read_only=True)
     con.execute(f"ATTACH '{Path(edgar_db).as_posix()}' AS edgar (READ_ONLY)")
-    sql = TICKER_ON_SQL.format(events="edgar.events.announcements", map="ref.ticker_cik")
+    sql = event_tickers_sql(con)
     df = con.execute(f"""SELECT event_type, year(day0) AS year, count(*) AS events,
                                 count(ticker) AS with_ticker, round(count(ticker) / count(*), 3) AS share
                          FROM ({sql}) GROUP BY 1, 2 ORDER BY 1, 2""").df()
@@ -220,6 +244,124 @@ def coverage(db: str = REFERENCE, edgar_db: str = EDGAR) -> pd.DataFrame:
     tot["share"] = (tot.with_ticker / tot.events).round(3)
     print("\n" + tot.to_string())
     return df
+
+
+def _sec():
+    from insider_screen.http import DEFAULT_USER_AGENT, PoliteClient
+    return PoliteClient(cache_dir="data/cache/sec", user_agent=DEFAULT_USER_AGENT, max_per_second=5)
+
+
+def _index_url(cik: int, accession: str) -> str:
+    from insider_screen.press_release import INDEX_URL
+    return INDEX_URL.format(cik=int(cik), folder=accession.replace("-", ""), acc=accession)
+
+
+def _release_ticker(sec, cik: int, accession: str, company: str) -> tuple[str | None, str]:
+    from insider_screen.market_move import release_ticker
+    try:
+        return release_ticker(sec, _index_url(cik, accession), None, company)
+    except Exception as err:  # one bad filing shouldn't stop the run
+        return None, f"lookup failed: {err}"[:200]
+
+
+def classify(map_ticker: str, release: str | None, cik: int, ranges: pd.DataFrame) -> str:
+    if not release:
+        return "no_ticker_in_release"
+    if release == map_ticker:
+        return "agree"
+    holders = ranges[ranges.ticker == release]
+    if holders.empty:
+        return "release_ticker_not_in_map"
+    if (holders.cik == cik).any():
+        return "same_company_other_ticker"
+    return "release_ticker_other_company"
+
+
+def check(db: str = REFERENCE, edgar_db: str = EDGAR, n: int = 200, seed: int = 7,
+          out: str = "data/ticker_check.csv", sec=None) -> pd.DataFrame:
+    """Compare the map's ticker with the press release's for n sampled events (n/3 per event type)."""
+    sec = sec or _sec()
+    con = duckdb.connect(db, read_only=True)
+    con.execute(f"ATTACH '{Path(edgar_db).as_posix()}' AS edgar (READ_ONLY)")
+    mapped = TICKER_ON_SQL.format(events="edgar.events.announcements", map="ref.ticker_cik")
+    per_type = max(1, n // 3)
+    sample = con.execute(f"""
+        WITH m AS ({mapped})
+        SELECT m.event_id, m.event_type, m.cik, c.name AS company, m.accession, m.day0, m.ticker AS map_ticker
+        FROM m JOIN edgar.raw.edgar_companies c USING (cik)
+        WHERE m.ticker IS NOT NULL
+        QUALIFY row_number() OVER (PARTITION BY m.event_type ORDER BY hash(m.event_id || '{int(seed)}')) <= {per_type}
+        ORDER BY m.event_type, m.day0""").df()
+    ranges = con.execute("SELECT ticker, cik FROM ref.ticker_cik").df()
+    con.close()
+    print(f"Checking {len(sample)} events against their 8-K press releases")
+    results = []
+    for k, r in enumerate(sample.itertuples(index=False), 1):
+        release, how = _release_ticker(sec, r.cik, r.accession, r.company)
+        results.append({"release_ticker": release or "", "outcome": classify(r.map_ticker, release, r.cik, ranges),
+                        "how": how})
+        if k % 25 == 0:
+            print(f"  {k}/{len(sample)}")
+    df = pd.concat([sample, pd.DataFrame(results)], axis=1)
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out, index=False, encoding="utf-8-sig")
+    comparable = df[df.outcome != "no_ticker_in_release"]
+    print("\n" + pd.crosstab(df.event_type, df.outcome, margins=True).to_string())
+    if len(comparable):
+        bad = comparable[comparable.outcome != "agree"]
+        print(f"\nError rate: {len(bad)} of {len(comparable)} comparable events ({len(bad) / len(comparable):.1%})")
+        if len(bad):
+            print(bad[["event_type", "company", "day0", "map_ticker", "release_ticker", "outcome"]].to_string(index=False))
+    print(f"\nAll rows: {out}")
+    return df
+
+
+def fill(db: str = REFERENCE, edgar_db: str = EDGAR, types: list[str] | None = None, sec=None,
+         limit: int | None = None) -> None:
+    """ref.ticker_supplement: a press-release ticker for each company-year that has events without one."""
+    sec = sec or _sec()
+    con = duckdb.connect(db)
+    con.execute("CREATE SCHEMA IF NOT EXISTS ref")
+    con.execute("""CREATE TABLE IF NOT EXISTS ref.ticker_supplement (
+        cik BIGINT, year INTEGER, ticker VARCHAR, conflict BOOLEAN, accession VARCHAR, how VARCHAR)""")
+    con.execute(f"ATTACH '{Path(edgar_db).as_posix()}' AS edgar (READ_ONLY)")
+    mapped = TICKER_ON_SQL.format(events="edgar.events.announcements", map="ref.ticker_cik")
+    type_filter = f"AND m.event_type IN ({', '.join(repr(t) for t in types)})" if types else ""
+    # per company-year without a ticker: the latest event's 8-K first, then up to two more as fallbacks
+    todo = con.execute(f"""
+        WITH m AS ({mapped})
+        SELECT m.cik, year(m.day0) AS year, c.name AS company, list(m.accession ORDER BY m.day0 DESC)[1:3] AS accessions,
+               max(m.day0) AS last_day0
+        FROM m JOIN edgar.raw.edgar_companies c USING (cik)
+        WHERE m.ticker IS NULL {type_filter}
+          AND NOT EXISTS (SELECT 1 FROM ref.ticker_supplement s WHERE s.cik = m.cik AND s.year = year(m.day0))
+        GROUP BY 1, 2, 3 ORDER BY 2, 1""").df()
+    if limit:
+        todo = todo.head(limit)
+    print(f"{len(todo)} company-years to look up")
+    found = 0
+    for k, r in enumerate(todo.itertuples(index=False), 1):
+        ticker, how, acc = None, "no 8-K tried", None
+        for acc in r.accessions:
+            ticker, how = _release_ticker(sec, r.cik, acc, r.company)
+            if ticker:
+                break
+        conflict = False
+        if ticker:
+            other = con.execute(
+                """SELECT name FROM ref.ticker_cik WHERE ticker = ? AND cik IS DISTINCT FROM ?
+                   AND (valid_from IS NULL OR valid_from <= ?) AND (valid_to IS NULL OR valid_to >= ?)""",
+                [ticker, int(r.cik), r.last_day0, r.last_day0]).fetchone()
+            if other:
+                conflict, how = True, f"{how}; map gives {ticker} to {other[0]} on {r.last_day0:%Y-%m-%d}"
+            else:
+                found += 1
+        con.execute("INSERT INTO ref.ticker_supplement VALUES (?, ?, ?, ?, ?, ?)",
+                    [int(r.cik), int(r.year), ticker, conflict, acc, how[:300]])
+        if k % 50 == 0 or k == len(todo):
+            print(f"  {k}/{len(todo)}: {found} tickers found")
+    con.close()
+    print("Run coverage to see the effect.")
 
 
 def main() -> None:
@@ -232,6 +374,16 @@ def main() -> None:
     c = sub.add_parser("coverage")
     c.add_argument("--db", default=REFERENCE)
     c.add_argument("--edgar-db", default=EDGAR)
+    k = sub.add_parser("check")
+    k.add_argument("--db", default=REFERENCE)
+    k.add_argument("--edgar-db", default=EDGAR)
+    k.add_argument("--n", type=int, default=200)
+    k.add_argument("--out", default="data/ticker_check.csv")
+    f = sub.add_parser("fill")
+    f.add_argument("--db", default=REFERENCE)
+    f.add_argument("--edgar-db", default=EDGAR)
+    f.add_argument("--types", nargs="*", help="event types, e.g. acquisition_target earnings")
+    f.add_argument("--limit", type=int)
     a = ap.parse_args()
     if a.cmd == "download":
         key = os.environ.get("MASSIVE_API_KEY")
@@ -240,6 +392,10 @@ def main() -> None:
         download(Massive(key), a.db)
     elif a.cmd == "build":
         build(a.db)
+    elif a.cmd == "check":
+        check(a.db, a.edgar_db, a.n, out=a.out)
+    elif a.cmd == "fill":
+        fill(a.db, a.edgar_db, a.types, limit=a.limit)
     else:
         coverage(a.db, a.edgar_db)
 

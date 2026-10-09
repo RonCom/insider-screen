@@ -133,4 +133,9 @@ uv run python -m insider_screen.tickers download
 uv run python -m insider_screen.tickers build
 # share of events with a ticker on day 0, by event type and year
 uv run python -m insider_screen.tickers coverage
+# error rate: map vs the ticker in each sampled 8-K's press release (data/ticker_check.csv)
+uv run python -m insider_screen.tickers check --n 200
+# fill company-years with no ticker from their 8-K press releases (resumable; targets first)
+uv run python -m insider_screen.tickers fill --types acquisition_target
+uv run python -m insider_screen.tickers fill
 ```
