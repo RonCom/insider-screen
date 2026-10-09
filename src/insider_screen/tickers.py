@@ -307,11 +307,10 @@ def _name_key(name: str | None) -> str:
 def names(db: str = REFERENCE, edgar_db: str = EDGAR, finra_db: str = FINRA) -> pd.DataFrame:
     """ref.ticker_supplement rows from names, no network: for each company-year still without a ticker,
     a map row whose name equals the company's current or former EDGAR name (after normalizing) and whose
-    dates overlap the year's events. The map row may have no CIK (Massive leaves it off many delisted
+    dates overlap the year's events, and that traded (FINRA volume) during them. The map row may have no CIK (Massive leaves it off many delisted
     tickers) or a CIK that EDGAR doesn't know or knows under the same name (Versar's VSR carries
     another CIK). Taken only when exactly one ticker matches, no differently named company holds it, and
-    no other company's events carry it, through the CIK join, between the year's first and last event
-    (that rejects a parent's ticker for a subsidiary, e.g. DUK for Duke Energy Carolinas, whose former
+    no other company's events carry it, through the CIK join, in the same year (that rejects a parent's ticker for a subsidiary, e.g. DUK for Duke Energy Carolinas, whose former
     name is Duke Energy Corp, and another firm of the same short name, e.g. PHI Inc for PHI Group)."""
     con = duckdb.connect(db)
     con.execute("CREATE SCHEMA IF NOT EXISTS ref")
@@ -323,10 +322,17 @@ def names(db: str = REFERENCE, edgar_db: str = EDGAR, finra_db: str = FINRA) -> 
     mapped = ticker_on_sql(con, "edgar.events.announcements")
     # each ticker's events through the CIK join: a ticker another company's events carry over the same
     # dates belongs to that company (a parent, an operating subsidiary, a different firm of the same name)
-    taken: dict[str, list] = {}
-    for t, cik, day in con.execute(f"""SELECT ticker, cik, CAST(day0 AS DATE) FROM ({mapped})
-                                       WHERE ticker IS NOT NULL""").fetchall():
-        taken.setdefault(t, []).append((pd.Timestamp(day), int(cik)))
+    taken: dict[tuple[str, int], set] = {}
+    for t, cik, year in con.execute(f"""SELECT DISTINCT ticker, cik, year(day0) FROM ({mapped})
+                                        WHERE ticker IS NOT NULL""").fetchall():
+        taken.setdefault((t, int(year)), set()).add(int(cik))
+    # months each symbol traded (FINRA volume): a ticker must have traded during the company-year's events,
+    # which rules out a ticker the company only got later (FS KKR Capital Corp. II before FSKR listed)
+    has_volume = con.execute("SELECT count(*) FROM duckdb_tables() WHERE table_name = 'ticker_volume'").fetchone()[0]
+    traded: dict[str, list] = {}
+    if has_volume:
+        for sym, month in con.execute("SELECT symbol, CAST(month AS DATE) FROM ticker_volume WHERE vol > 0").fetchall():
+            traded.setdefault(sym, []).append(pd.Timestamp(month))
     todo = con.execute(f"""
         WITH m AS ({mapped})
         SELECT m.cik, year(m.day0) AS year, {_names_sql(con)} AS names,
@@ -356,6 +362,8 @@ def names(db: str = REFERENCE, edgar_db: str = EDGAR, finra_db: str = FINRA) -> 
             for c in by_name.get(key, []):
                 if not pd.isna(c.cik) and int(c.cik) == int(r.cik):
                     continue  # the CIK join already had this row; its dates don't fit
+                if not pd.isna(c.cik) and len(key) < 5:
+                    continue  # short names collide across companies (GTX Corp and GTx Inc both give "gtx")
                 if not same_company(c.cik, key):
                     continue
                 if (pd.isna(c.valid_from) or c.valid_from <= hi) and (pd.isna(c.valid_to) or c.valid_to >= lo):
@@ -368,7 +376,10 @@ def names(db: str = REFERENCE, edgar_db: str = EDGAR, finra_db: str = FINRA) -> 
                         & (cands.valid_to.isna() | (cands.valid_to >= lo))]
         if any(int(h) != int(r.cik) and not same_company(h, _name_key(mname)) for h in holders.cik):
             continue
-        if any(pd.Timestamp(lo) <= day <= pd.Timestamp(hi) and cik != int(r.cik) for day, cik in taken.get(ticker, [])):
+        if taken.get((ticker, int(r.year)), set()) - {int(r.cik)}:
+            continue
+        if has_volume and not any(pd.Timestamp(lo).replace(day=1) - pd.DateOffset(months=1) <= m <= pd.Timestamp(hi)
+                                  for m in traded.get(ticker, [])):
             continue
         how = (f"name match: '{mname}' in the map has no CIK" if pd.isna(mcik)
                else f"name match: '{mname}' in the map under CIK {int(mcik)}")

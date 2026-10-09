@@ -407,7 +407,38 @@ def test_names_rejects_a_ticker_another_company_carries(tmp_path):
         ('s1', 5, 'earnings', TIMESTAMP '2019-01-01')) t(event_id, cik, event_type, day0)""")
     con.close()
     out = tk.names(db, edgar)
-    # HarborOne's old holding company kept HONE until the second step; the new one's events start later
-    assert list(zip(out.cik, out.ticker)) == [(1668224, "HONE")]
+    # HarborOne's old holding company did hold HONE until the second step, but the new one's events carry
+    # it the same year: refused, the price of also refusing subsidiaries that file on other days
+    assert out.empty
     con = duckdb.connect(db)
     assert con.execute("SELECT count(*) FROM ref.ticker_supplement WHERE cik = 5").fetchone()[0] == 0
+
+
+def test_names_needs_finra_volume_and_long_names(tmp_path):
+    db, edgar, finra = (str(tmp_path / f) for f in ("reference.duckdb", "edgar.duckdb", "finra.duckdb"))
+    con = duckdb.connect(db)
+    con.execute("CREATE SCHEMA ref")
+    con.execute("""CREATE TABLE ref.ticker_cik AS SELECT ticker, cik::BIGINT AS cik, name, 'CS' AS type,
+                   valid_from::DATE AS valid_from, valid_to::DATE AS valid_to FROM (VALUES
+        ('FSKR', 1422183, 'FS KKR Capital Corp. II', NULL, NULL),
+        ('GTXI', 1260990, 'GTX Inc.', NULL, NULL),
+        ('TRCB', NULL, 'Two River Bancorp', NULL, NULL)) t(ticker, cik, name, valid_from, valid_to)""")
+    con.close()
+    con = duckdb.connect(edgar)
+    con.execute("CREATE SCHEMA events; CREATE SCHEMA raw")
+    con.execute("""CREATE TABLE raw.edgar_companies AS SELECT * FROM (VALUES
+        (1525759, 'FS KKR Capital Corp. II', ''), (1375793, 'Metalert, Inc.', 'GTX CORP'),
+        (1343034, 'TWO RIVER BANCORP', '')) t(cik, name, former_names)""")
+    con.execute("""CREATE TABLE events.announcements AS SELECT * FROM (VALUES
+        ('f', 1525759, 'earnings', TIMESTAMP '2017-05-01'), ('g', 1375793, 'earnings', TIMESTAMP '2018-05-01'),
+        ('t', 1343034, 'earnings', TIMESTAMP '2018-05-01')) t(event_id, cik, event_type, day0)""")
+    con.close()
+    con = duckdb.connect(finra)
+    con.execute("CREATE SCHEMA raw")
+    con.execute("""CREATE TABLE raw.finra_short_daily AS SELECT * FROM (VALUES
+        (DATE '2020-07-01', 'FSKR', 1000), (DATE '2018-05-01', 'GTXI', 1000), (DATE '2018-04-30', 'TRCB', 500))
+        t(date, symbol, total_volume)""")
+    con.close()
+    out = tk.names(db, edgar, finra)
+    # FSKR only traded from 2020; "gtx" is too short to trust across CIKs; TRCB traded the month before
+    assert list(zip(out.cik, out.ticker)) == [(1343034, "TRCB")]
