@@ -161,6 +161,12 @@ def run(db: str, model: str, edgar_db: str = EDGAR) -> pd.DataFrame:
            WHERE t.model = ? AND t.is_insider_trading_case""",
         [model_key(model)],
     ).df()
+    if traded.empty:
+        have = con.execute(f"SELECT model, count(DISTINCT lr_no) FROM {TABLE} GROUP BY 1 ORDER BY 2 DESC").fetchall()
+        con.close()
+        raise SystemExit(f"No insider-trading rows in {TABLE} for model {model_key(model)!r}; labels left as they "
+                         f"were. Models there (releases): {have or 'none'}. Pass --model, or run "
+                         f"`extract run --model ...` first.")
     companies = con.execute("SELECT cik, name, former_names FROM edgar.raw.edgar_companies").df()
     events = con.execute("SELECT event_id, cik, event_type, day0 FROM edgar.events.announcements").df()
     cal = xc.get_calendar("XNYS", start="2005-01-01")
