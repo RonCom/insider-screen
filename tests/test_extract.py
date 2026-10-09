@@ -229,3 +229,20 @@ def test_compare_against_reviewed_handcheck(tmp_path):
     ir, dr = ex.compare(db, "small", str(csv))
     # Delta: no date in the release and none extracted counts as a match
     assert (ir, dr) == (0.75, 0.5)
+
+
+def test_runaway_reasoning_retried_without_it():
+    from insider_screen import extract as ex
+    good = json.dumps({"release_kind": "new_charges", "is_insider_trading_case": True, "events": [ev()]})
+    seen = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        seen.append(body.get("think"))
+        if len(seen) == 1:
+            return httpx.Response(200, json={"done_reason": "length",
+                                             "message": {"content": "", "thinking": "hmm " * 8000}})
+        return httpx.Response(200, json={"done_reason": "stop", "message": {"content": good}})
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    assert call_ollama("text", "m", client).events[0].issuer_name == "Target Co."
+    assert seen[1] is False and "without reasoning" in ex.NOTES[0]

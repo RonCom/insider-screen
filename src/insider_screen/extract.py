@@ -155,6 +155,9 @@ def _post_waiting(client: httpx.Client, payload: dict) -> httpx.Response:
             waited += step
 
 
+NOTES: list[str] = []  # how the last call_ollama got its answer, when it needed a retry
+
+
 def call_ollama(text: str, model: str, client: httpx.Client) -> ReleaseExtraction:
     payload = {
         "model": model,
@@ -167,6 +170,7 @@ def call_ollama(text: str, model: str, client: httpx.Client) -> ReleaseExtractio
             {"role": "user", "content": text[: (NUM_CTX - 1500) * 4]},
         ],
     }
+    NOTES.clear()
     last_err: Exception | None = None
     for _ in range(2):
         resp = _post_waiting(client, payload)
@@ -174,12 +178,18 @@ def call_ollama(text: str, model: str, client: httpx.Client) -> ReleaseExtractio
         body = resp.json()
         content = body["message"]["content"]
         if body.get("done_reason") == "length":
-            # the context filled before the answer finished (a long release, or long reasoning): retry once
-            # with twice the context, same input; only these releases pay for the larger context
+            # the context filled before the answer finished. If reasoning took the space (it can loop for
+            # 30,000 characters without answering), retry once with reasoning off; otherwise retry once with
+            # twice the context. Only these releases are affected; the retry is noted with the extraction.
             thought = len(body["message"].get("thinking") or "")
             last_err = ValueError(f"output cut off at the token limit ({len(content)} characters of answer, "
                                   f"{thought} of reasoning, context {payload['options']['num_ctx']})")
-            payload = {**payload, "options": {**payload["options"], "num_ctx": NUM_CTX * 2}}
+            if thought > max(2000, 4 * len(content)):
+                payload = {**payload, "think": False}
+                NOTES.append("retried without reasoning: reasoning filled the context")
+            else:
+                payload = {**payload, "options": {**payload["options"], "num_ctx": payload["options"]["num_ctx"] * 2}}
+                NOTES.append("retried with twice the context")
             continue
         try:
             return ReleaseExtraction.model_validate_json(content)
@@ -387,10 +397,10 @@ def run(db: str, model: str, limit: int | None, lrs_from: str | None = None) -> 
             t0 = time.monotonic()
             try:
                 ext = call_ollama(text, model, client)
-                _record(con, (lr_no, key, True, None, ext.model_dump_json()))
+                _record(con, (lr_no, key, True, "; ".join(NOTES) or None, ext.model_dump_json()))
                 con.execute(f"DELETE FROM {TABLE} WHERE lr_no = ? AND model = ?", [lr_no, key])
                 n_events = _insert_events(con, lr_no, key, ext, text)
-                status = f"{n_events} event{'s' if n_events != 1 else ''}"
+                status = f"{n_events} event{'s' if n_events != 1 else ''}" + (f" ({'; '.join(NOTES)})" if NOTES else "")
             except (ValidationError, ValueError, httpx.HTTPError, KeyError) as err:
                 _record(con, (lr_no, key, False, str(err)[:500], None))
                 failed_n += 1
