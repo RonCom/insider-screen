@@ -79,12 +79,16 @@ def test_build_targets_end_to_end(tmp_path):
     con.execute("CREATE SCHEMA events; CREATE SCHEMA raw")
     con.execute(f"""CREATE TABLE events.target_day0 AS SELECT 'acq-1' AS event_id, 'ACME' AS ticker, 'map' AS ticker_source,
                     DATE '{day0}' AS day0, DATE '{day0}' AS day0_8k, '8k_confirmed' AS basis""")
-    con.execute("CREATE TABLE events.announcements AS SELECT 'acq-1' AS event_id, 7 AS cik")
-    con.execute("CREATE TABLE raw.edgar_companies AS SELECT 7 AS cik, '2834' AS sic")
+    con.execute(f"""CREATE TABLE events.announcements AS SELECT * FROM (VALUES
+        ('acq-1', 7, 'acquisition_target', TIMESTAMP '{day0}', 'index_header'),
+        ('ear-1', 7, 'earnings', TIMESTAMP '{cal_sessions[300]}', 'earliest_candidate'))
+        t(event_id, cik, event_type, day0, day0_basis)""")
+    con.execute("CREATE TABLE raw.edgar_companies AS SELECT 7 AS cik, 'Acme' AS name, '2834' AS sic")
     con.close()
     con = duckdb.connect(ref)
     con.execute("CREATE SCHEMA ref")
-    con.execute("CREATE TABLE ref.ticker_cik AS SELECT 'ACME' AS ticker, 7::BIGINT AS cik, 'CS' AS type")
+    con.execute("""CREATE TABLE ref.ticker_cik AS SELECT 'ACME' AS ticker, 7::BIGINT AS cik, 'Acme' AS name,
+                   'CS' AS type, NULL::DATE AS valid_from, NULL::DATE AS valid_to""")
     con.close()
     rng = np.random.default_rng(1)
     n = len(cal_sessions)
@@ -109,3 +113,6 @@ def test_build_targets_end_to_end(tmp_path):
     pre = df[df.window == "pre"].iloc[0]
     assert pre.in_universe and pre.abn_volume == pytest.approx(0) and pre.short_share_abn == pytest.approx(0)
     assert set(df.window) == {"pre", "placebo"}
+    assert not math.isnan(pre.day0_ar)
+    ear = ft.build_earnings(edgar, ref, prices, finra, out)
+    assert list(ear.event_id.unique()) == ["ear-1"] and ear[ear.window == "pre"].iloc[0].n_window == 20

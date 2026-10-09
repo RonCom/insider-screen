@@ -1,4 +1,4 @@
-"""Pre-event features (spec, "Features"), acquisition targets first.
+"""Pre-event features (spec, "Features") for acquisition targets and earnings events.
 
 Windows are counted in NYSE sessions from day 0 (the final day 0 from events.target_day0):
 pre-event window -20..-1, baseline -250..-31. The placebo (H5) uses -70..-51 with baseline -300..-81,
@@ -19,8 +19,12 @@ volume, the size proxy: no shares-outstanding source is free, so market cap isn'
 No feature uses data from day 0 or later: `event_features` drops every row dated on or after day 0
 before computing anything, and tests/test_features.py changes all such rows and checks nothing moves.
 
+Each row also has day0_ar, the day-0 return minus SPY's: an outcome, not a feature, used only to
+select negative-return earnings events (H3) and to orient earnings scores.
+
 Usage:
     uv run python -m insider_screen.features targets
+    uv run python -m insider_screen.features earnings
 """
 
 from __future__ import annotations
@@ -103,84 +107,148 @@ def _load(con, sql: str, params=None) -> pd.DataFrame:
     return con.execute(sql, params or []).df()
 
 
-def build_targets(edgar_db: str = EDGAR, reference_db: str = REFERENCE, prices_db: str = PRICES,
-                  finra_db: str = FINRA, out_db: str = FEATURES) -> pd.DataFrame:
-    con = duckdb.connect(edgar_db, read_only=True)
-    ev = _load(con, """SELECT d.event_id, a.cik, c.sic, d.ticker, d.ticker_source, d.day0, d.day0_8k, d.basis
-                       FROM events.target_day0 d JOIN events.announcements a USING (event_id)
-                       JOIN raw.edgar_companies c USING (cik)
-                       WHERE d.ticker IS NOT NULL""")
+UNIVERSE_EXCLUDED_TYPES = ["ADRC", "ADRP", "ADRS", "GDR", "NYRS"]
+SUMMARY_COLS = ["abn_volume", "last5_share", "car", "scar", "short_share_abn", "short_share_z",
+                "abn_short_trades", "small_trade_share_abn"]
+
+
+def day0_ar(day0: date, sessions: list[date], close: pd.Series, spy: pd.Series) -> float:
+    """Day-0 return minus SPY's. An outcome, not a feature: it only says which way the news went (H3 picks
+    negative-return earnings events by it, and earnings scores orient scar by its sign)."""
+    if day0 not in close.index:
+        return np.nan
+    i = sessions.index(day0) if day0 in sessions else None
+    if not i:
+        return np.nan
+    prev = sessions[i - 1]
+    try:
+        return float(close[day0] / close[prev] - 1 - (spy[day0] / spy[prev] - 1))
+    except (KeyError, ZeroDivisionError):
+        return np.nan
+
+
+def compute(ev: pd.DataFrame, prices_db: str = PRICES, finra_db: str = FINRA, chunk: int = 400,
+            every: int = 5000) -> pd.DataFrame:
+    """Features for events with columns event_id, cik, sic, ticker, type, day0 (date), day0_basis; tickers
+    are loaded `chunk` at a time to bound memory."""
+    cal = xc.get_calendar("XNYS", start="2015-01-01")
+    sessions = [s.date() for s in cal.sessions]
+    con = duckdb.connect(prices_db, read_only=True)
+    spy = _load(con, """SELECT date, close FROM raw.alpaca_bars_daily WHERE symbol = 'SPY' AND adjustment = 'all'
+                        ORDER BY date""")
+    spy = pd.Series(spy.close.values, index=pd.to_datetime(spy.date).dt.date)
+    try:
+        fcon = duckdb.connect(finra_db, read_only=True)
+    except duckdb.IOException as err:
+        print(f"FINRA data unavailable ({err}); off-exchange features left empty")
+        fcon = None
+    has_trades = fcon is not None and fcon.execute(
+        "SELECT count(*) FROM duckdb_tables() WHERE table_name = 'finra_short_trades_daily'").fetchone()[0]
+    if fcon is not None and not has_trades:
+        print("No monthly short-sale transaction data; trade-count features left empty")
+
+    syms = sorted(set(ev.ticker))
+    rows, done = [], 0
+    for k in range(0, len(syms), chunk):
+        part = syms[k:k + chunk]
+        con.register("syms", pd.DataFrame({"symbol": part}))
+        bars = _load(con, """SELECT symbol, date, adjustment, close, volume FROM raw.alpaca_bars_daily
+                             JOIN syms USING (symbol)""")
+        con.unregister("syms")
+        bars["date"] = pd.to_datetime(bars.date).dt.date
+        short = trades = None
+        if fcon is not None:
+            fcon.register("syms", pd.DataFrame({"symbol": part}))
+            short = _load(fcon, """SELECT symbol, date, sum(short_volume) AS short_volume,
+                                          sum(total_volume) AS total_volume
+                                   FROM raw.finra_short_daily JOIN syms USING (symbol) GROUP BY 1, 2""")
+            if has_trades:
+                trades = _load(fcon, """SELECT symbol, date, sum(short_trades) AS short_trades,
+                                               sum(small_trades) AS small_trades
+                                        FROM raw.finra_short_trades_daily JOIN syms USING (symbol) GROUP BY 1, 2""")
+            fcon.unregister("syms")
+        for df in (short, trades):
+            if df is not None:
+                df["date"] = pd.to_datetime(df.date).dt.date
+        by = lambda df: {} if df is None else {s: g.set_index("date").drop(columns="symbol")  # noqa: E731
+                                                for s, g in df.groupby("symbol")}
+        adj = by(bars[bars.adjustment == "all"].drop(columns="adjustment"))
+        raw = by(bars[bars.adjustment == "raw"].drop(columns="adjustment"))
+        sh_by, tr_by = by(short), by(trades)
+        for e in ev[ev.ticker.isin(part)].itertuples(index=False):
+            if e.ticker not in adj:
+                continue
+            st = adj[e.ticker][["close", "volume"]].join(
+                raw[e.ticker][["close"]].rename(columns={"close": "close_raw"}) if e.ticker in raw
+                else pd.DataFrame(columns=["close_raw"]), how="left")
+            ar0 = day0_ar(e.day0, sessions, st.close, spy)
+            for window in WINDOWS:
+                f = event_features(e.day0, sessions, st, spy, sh_by.get(e.ticker), tr_by.get(e.ticker), window)
+                rows.append({"event_id": e.event_id, "cik": e.cik, "ticker": e.ticker, "ticker_type": e.type,
+                             "sic": e.sic, "day0": e.day0, "day0_basis": e.day0_basis, "day0_ar": ar0, **f})
+            done += 1
+            if every and done % every == 0:
+                print(f"  {done}/{len(ev)} events", flush=True)
     con.close()
-    ev["day0"] = pd.to_datetime(ev.day0).dt.date
+    if fcon is not None:
+        fcon.close()
+    out = pd.DataFrame(rows)
+    if len(out):
+        out["in_universe"] = (out.price_d30 >= 1) & ~out.ticker_type.isin(UNIVERSE_EXCLUDED_TYPES)
+    return out
+
+
+def _write(out: pd.DataFrame, table: str, out_db: str, label: str) -> None:
+    con = duckdb.connect(out_db)
+    con.execute("CREATE SCHEMA IF NOT EXISTS features")
+    con.register("out", out)
+    con.execute(f"CREATE OR REPLACE TABLE features.{table} AS SELECT * FROM out")
+    con.close()
+    pre = out[out.window == "pre"]
+    print(f"{len(pre)} {label} with bars ({int(pre.in_universe.sum())} in the universe: price >= $1 at "
+          f"day -30, not an ADR); features.{table} in {out_db}")
+    cols = [c for c in SUMMARY_COLS if c in out]
+    print("\nPre-event window, universe events: coverage and quartiles")
+    print(pre[pre.in_universe][cols].describe(percentiles=[.25, .5, .75]).T[["count", "25%", "50%", "75%"]]
+          .round(3).to_string())
+
+
+def _with_types(ev: pd.DataFrame, reference_db: str) -> pd.DataFrame:
     con = duckdb.connect(reference_db, read_only=True)
     types = _load(con, "SELECT DISTINCT ticker, cik, type FROM ref.ticker_cik")
     con.close()
     ev = ev.merge(types, on=["ticker", "cik"], how="left").drop_duplicates("event_id")
-    syms = sorted(set(ev.ticker))
+    ev["day0"] = pd.to_datetime(ev.day0).dt.date
+    return ev
 
-    con = duckdb.connect(prices_db, read_only=True)
-    con.register("syms", pd.DataFrame({"symbol": syms + ["SPY"]}))
-    bars = _load(con, """SELECT symbol, date, adjustment, close, volume FROM raw.alpaca_bars_daily
-                         JOIN syms USING (symbol)""")
+
+def build_targets(edgar_db: str = EDGAR, reference_db: str = REFERENCE, prices_db: str = PRICES,
+                  finra_db: str = FINRA, out_db: str = FEATURES) -> pd.DataFrame:
+    con = duckdb.connect(edgar_db, read_only=True)
+    ev = _load(con, """SELECT d.event_id, a.cik, c.sic, d.ticker, d.day0, d.basis AS day0_basis
+                       FROM events.target_day0 d JOIN events.announcements a USING (event_id)
+                       JOIN raw.edgar_companies c USING (cik)
+                       WHERE d.ticker IS NOT NULL""")
     con.close()
-    bars["date"] = pd.to_datetime(bars.date).dt.date
-    adj = bars[bars.adjustment == "all"].set_index(["symbol", "date"])
-    raw = bars[bars.adjustment == "raw"].set_index(["symbol", "date"])
-    spy = adj.loc["SPY"].close
+    out = compute(_with_types(ev, reference_db), prices_db, finra_db)
+    _write(out, "targets", out_db, "target events")
+    return out
 
-    short = trades = None
-    try:
-        con = duckdb.connect(finra_db, read_only=True)
-        con.register("syms", pd.DataFrame({"symbol": syms}))
-        short = _load(con, """SELECT symbol, date, sum(short_volume) AS short_volume, sum(total_volume) AS total_volume
-                              FROM raw.finra_short_daily JOIN syms USING (symbol) GROUP BY 1, 2""")
-        try:
-            trades = _load(con, """SELECT symbol, date, sum(short_trades) AS short_trades,
-                                          sum(small_trades) AS small_trades
-                                   FROM raw.finra_short_trades_daily JOIN syms USING (symbol) GROUP BY 1, 2""")
-        except duckdb.CatalogException:
-            print("No monthly short-sale transaction data; trade-count features left empty")
-        con.close()
-    except duckdb.IOException as err:
-        print(f"FINRA data unavailable ({err}); off-exchange features left empty")
-    for df in (short, trades):
-        if df is not None:
-            df["date"] = pd.to_datetime(df.date).dt.date
-    short = short.set_index(["symbol", "date"]) if short is not None else None
-    trades = trades.set_index(["symbol", "date"]) if trades is not None else None
 
-    cal = xc.get_calendar("XNYS", start="2015-01-01")
-    sessions = [s.date() for s in cal.sessions]
-    rows = []
-    for e in ev.itertuples(index=False):
-        if e.ticker not in adj.index.get_level_values(0):
-            continue
-        st = adj.loc[e.ticker][["close", "volume"]].join(
-            raw.loc[e.ticker][["close"]].rename(columns={"close": "close_raw"}) if e.ticker in raw.index.get_level_values(0)
-            else pd.DataFrame(columns=["close_raw"]), how="left")
-        sh = short.loc[e.ticker] if short is not None and e.ticker in short.index.get_level_values(0) else None
-        tr = trades.loc[e.ticker] if trades is not None and e.ticker in trades.index.get_level_values(0) else None
-        for window in WINDOWS:
-            f = event_features(e.day0, sessions, st, spy, sh, tr, window)
-            rows.append({"event_id": e.event_id, "cik": e.cik, "ticker": e.ticker, "ticker_type": e.type,
-                         "sic": e.sic, "day0": e.day0, "day0_basis": e.basis, **f})
-    out = pd.DataFrame(rows)
-    out["in_universe"] = (out.price_d30 >= 1) & ~out.ticker_type.isin(["ADRC", "ADRP", "ADRS", "GDR", "NYRS"])
-    con = duckdb.connect(out_db)
-    con.execute("CREATE SCHEMA IF NOT EXISTS features")
-    con.register("out", out)
-    con.execute("CREATE OR REPLACE TABLE features.targets AS SELECT * FROM out")
+def build_earnings(edgar_db: str = EDGAR, reference_db: str = REFERENCE, prices_db: str = PRICES,
+                   finra_db: str = FINRA, out_db: str = FEATURES) -> pd.DataFrame:
+    """Earnings events (Item 2.02) with a ticker on day 0. Day 0 is the 8-K day 0 (earliest day consistent
+    with EDGAR's hours); the day-0 rule is for acquisition targets only."""
+    from insider_screen import tickers
+    con = duckdb.connect(reference_db, read_only=True)
+    tickers.attach(con, edgar_db, finra_db)
+    ev = _load(con, f"""SELECT e.event_id, e.cik, c.sic, e.ticker, e.day0, e.day0_basis
+                        FROM ({tickers.event_tickers_sql(con)}) e JOIN edgar.raw.edgar_companies c USING (cik)
+                        WHERE e.event_type = 'earnings' AND e.ticker IS NOT NULL""")
     con.close()
-
-    pre = out[out.window == "pre"]
-    print(f"{len(pre)} target events with bars ({int(pre.in_universe.sum())} in the universe: price >= $1 at "
-          f"day -30, not an ADR); features.targets in {out_db}")
-    cols = ["abn_volume", "last5_share", "car", "scar", "short_share_abn", "short_share_z",
-            "abn_short_trades", "small_trade_share_abn"]
-    cols = [c for c in cols if c in out]
-    print("\nPre-event window, universe events: coverage and quartiles")
-    print(pre[pre.in_universe][cols].describe(percentiles=[.25, .5, .75]).T[["count", "25%", "50%", "75%"]]
-          .round(3).to_string())
+    print(f"{len(ev)} earnings events with a ticker", flush=True)
+    out = compute(_with_types(ev, reference_db), prices_db, finra_db)
+    _write(out, "earnings", out_db, "earnings events")
     return out
 
 
@@ -188,8 +256,9 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("targets")
-    ap.parse_args()
-    build_targets()
+    sub.add_parser("earnings")
+    a = ap.parse_args()
+    build_targets() if a.cmd == "targets" else build_earnings()
 
 
 if __name__ == "__main__":
