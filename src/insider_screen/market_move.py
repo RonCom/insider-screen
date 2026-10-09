@@ -49,8 +49,6 @@ def ticker_from_text(text: str, company: str) -> tuple[str | None, str]:
     name = normalize(company)
     scored = sorted(((fuzz.partial_ratio(name, normalize(before)), t) for t, before in hits), reverse=True)
     best, ticker = scored[0]
-    if len({t for _, t in hits}) == 1:
-        return ticker, "only ticker in the press release"
     if best >= 80:
         return ticker, f"ticker next to the company name (match {best:.0f})"
     return None, f"tickers {sorted({t for _, t in hits})} but none next to '{company}'"

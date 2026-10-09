@@ -66,6 +66,8 @@ def test_ticker_from_text():
     assert mm.ticker_from_text("Fitbit, Inc. (NYSE: FIT) today announced", "FITBIT, INC.")[0] == "FIT"
     assert mm.ticker_from_text("Acme (Nasdaq: ACME) and Beta (NASDAQ:BETA)", "Gamma Corp")[0] is None
     assert mm.ticker_from_text("no exchange listed", "Acme")[0] is None
+    # the only ticker given is the buyer's: not taken for the target
+    assert mm.ticker_from_text("Darden Restaurants, Inc. (NYSE: DRI) will acquire Chuy's", "CHUY'S HOLDINGS, INC.")[0] is None
 
 
 def test_market_command_end_to_end(tmp_path):

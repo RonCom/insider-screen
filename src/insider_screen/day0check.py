@@ -158,7 +158,10 @@ def score(csv: str, column: str = "press_release_et") -> pd.DataFrame:
     print(f"{len(differing)} differ by a trading session or more (threshold: more than {MAX_DIFFERING})")
     if len(differing):
         print(differing[["event_id", "company", "accepted_et", column, "session_diff"]].to_string(index=False))
-    if len(filled) < min(N, len(df)):
+    if len(differing) > MAX_DIFFERING:
+        print(f"FAIL: {len(differing)} differ, more than {MAX_DIFFERING}; blank rows can't change this. "
+              "Switch day 0 for acquisition targets to when the news reached the market.")
+    elif len(filled) < min(N, len(df)):
         print(f"Verdict pending: {N - len(filled)} more events needed for the spec's 50.")
     elif len(differing) > MAX_DIFFERING:
         print("FAIL: switch day 0 for acquisition targets to the press-release time.")
