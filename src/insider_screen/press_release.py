@@ -311,7 +311,8 @@ def _candidates(web, wire: str | None, headline: str) -> tuple[list[str], list[s
     doesn't name one), then DuckDuckGo and Bing. Returns (urls, what each search returned)."""
     log, urls = [], []
     q = " ".join(headline.split()[:14])
-    wires = [wire] if wire in SITE_SEARCH else ([] if wire else list(SITE_SEARCH))
+    # GlobeNewswire's search page stalls scripted requests, so it's tried only when the exhibit names it
+    wires = [wire] if wire in SITE_SEARCH else ([] if wire else ["PR Newswire"])
     for w in wires:
         url = site_search_url(w, q)
         status, page = _get(web, url, use_cache=False, store=False)
