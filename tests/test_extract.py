@@ -259,7 +259,7 @@ def test_fallback_redoes_empty_release_with_reasoning(tmp_path, monkeypatch):
 
     def fake(text, model, client, think=None):
         calls.append(think)
-        return ext([]) if think is False else ext([ev()])
+        return ext([ev(issuer_name="the issuer")]) if think is False else ext([ev()])
     monkeypatch.setattr(extract, "call_ollama", fake)
     extract.run(db, "m", None)
     assert calls == [False, None]

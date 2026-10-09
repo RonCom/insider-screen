@@ -384,12 +384,17 @@ def run(db: str, model: str, limit: int | None, lrs_from: str | None = None) -> 
             announcement_evidence VARCHAR, last_trade_date DATE, trade_check VARCHAR, trade_evidence VARCHAR,
             event_type VARCHAR, instruments VARCHAR, instruments_check VARCHAR, direction VARCHAR)"""
     )
+    # in fallback mode a release counts as done once it has events, or has already had the reasoning pass
+    done_sql = ("""SELECT x.lr_no FROM extracted.release_extractions x WHERE x.model = ? AND x.ok
+                   AND (coalesce(x.error, '') LIKE 'redone with reasoning%'
+                        OR x.lr_no IN (SELECT lr_no FROM {t} WHERE model = ?))""".format(t=TABLE)
+                if THINK_FALLBACK else
+                "SELECT lr_no FROM extracted.release_extractions WHERE model = ? AND ok")
     todo = con.execute(
-        """SELECT r.lr_no, r.text FROM raw.sec_litigation_releases r
-           WHERE r.is_insider_candidate
-             AND r.lr_no NOT IN (SELECT lr_no FROM extracted.release_extractions WHERE model = ? AND ok)
+        f"""SELECT r.lr_no, r.text FROM raw.sec_litigation_releases r
+           WHERE r.is_insider_candidate AND r.lr_no NOT IN ({done_sql})
            ORDER BY r.lr_no""",
-        [key],
+        [key, key] if THINK_FALLBACK else [key],
     ).fetchall()
     if lrs_from:
         keep = set(pd.read_csv(lrs_from, dtype=str).lr_no.astype(int))
@@ -407,8 +412,8 @@ def run(db: str, model: str, limit: int | None, lrs_from: str | None = None) -> 
                     # fast pass without reasoning; a release that fails or names no event is redone with it
                     try:
                         ext = call_ollama(text, model, client, think=False)
-                        if not ext.events:
-                            raise ValueError("no events")
+                        if not clean_events(ext, text):  # judged after cleaning: unnamed issuers are dropped
+                            raise ValueError("no named events")
                     except (ValidationError, ValueError, httpx.HTTPStatusError, KeyError) as first_err:
                         fallback_note = f"redone with reasoning ({str(first_err).splitlines()[0][:60]})"
                         ext = call_ollama(text, model, client)
