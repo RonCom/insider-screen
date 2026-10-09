@@ -133,3 +133,17 @@ def test_daily_command(tmp_path):
     assert out.day0_daily.tolist() == ["2023-11-01", "2023-11-02", ""]
     assert out.day0_daily_basis.tolist() == ["late_8k_shift", "8k_no_move", ""]
     assert out.prior_moves.tolist() == ["", "2023-11-01", ""]
+
+
+def test_shock_days_in_baseline_dont_raise_the_bar():
+    # Paragon 28: six -30% days in the baseline year inflated a plain SD threshold to 15.6%,
+    # so the +14% deal day after a late 8-K didn't count
+    f = frame({1: 0.14})
+    rets = f.close.pct_change().to_numpy(copy=True)
+    for k in (60, 90, 120, 150, 180, 210):
+        rets[len(f) - 1 - k] = -0.30
+    f["close"] = 20 * np.cumprod(np.nan_to_num(1 + rets, nan=1.0))
+    got = r.choose_day0(f, S, at(SESS[-2], "17:02"))
+    assert (got.day0, got.basis) == (SESS[-2], "late_8k_shift")
+    plain = 3 * (f.close.pct_change() - f.spy_close.pct_change()).iloc[-251:-30].std()
+    assert plain > 0.14  # the old threshold would have missed it

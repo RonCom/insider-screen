@@ -7,7 +7,8 @@ that, and nothing else, because any other move before the 8-K may be the pre-ann
 screen measures:
 
 - abnormal return AR = stock return - SPY return, per session; baseline sessions -250 to -31 before S
-  (the 8-K day 0) give the AR standard deviation and the median volume;
+  (the 8-K day 0) give the AR's typical size and the median volume. The typical size is a robust SD
+  (1.4826 x median absolute deviation), so a few shock days in the baseline year don't raise the bar;
 - a session qualifies as an announcement-sized move if |AR| >= max(THRESHOLD, SIGMAS x sd), volume
   >= VOLUME_X x median, and the cumulative AR from it through S keeps the same sign and at least half
   the threshold (not a one-day spike);
@@ -43,6 +44,11 @@ class Day0:
     prior_moves: list[date] = field(default_factory=list)  # announcement-sized moves before day 0, not used
 
 
+def robust_sd(x: pd.Series) -> float:
+    """1.4826 x median absolute deviation: the SD for normal data, not inflated by a few outliers."""
+    return float(1.4826 * (x - x.median()).abs().median())
+
+
 def choose_day0(daily: pd.DataFrame, s: date, accepted: pd.Timestamp | None = None) -> Day0:
     """`daily` is indexed by session date (ascending) with columns close, volume, spy_close and covers at
     least BASELINE[0] sessions before `s` through `s`. `accepted` is the 8-K's acceptance time (Eastern)."""
@@ -55,7 +61,7 @@ def choose_day0(daily: pd.DataFrame, s: date, accepted: pd.Timestamp | None = No
     base_ar, base_vol = ar.iloc[base].dropna(), d.volume.iloc[base]
     if len(base_ar) < MIN_BASELINE:
         return Day0(s, "8k_no_data", 0, f"{len(base_ar)} baseline sessions (need {MIN_BASELINE})")
-    thr = max(THRESHOLD, SIGMAS * base_ar.std())
+    thr = max(THRESHOLD, SIGMAS * robust_sd(base_ar))
     med_vol = base_vol.median()
 
     def qualifies(j: int) -> tuple[bool, str]:
