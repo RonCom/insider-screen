@@ -30,12 +30,13 @@ import duckdb
 import numpy as np
 import pandas as pd
 
-from insider_screen.db import FEATURES, RELEASES
+from insider_screen.db import EDGAR, FEATURES, RELEASES
 
 DEV_YEARS = (2017, 2020)
 FEATURES_USED = ["abn_volume", "last5_share", "scar", "short_share_z"]
 MIN_PEERS = 20
 MIN_FEATURES = 2
+Z_CAP = 5  # each robust z is capped at +-5, so one extreme feature (a SPAC's scar of 55) can't carry the mean
 SIC_DIVISIONS = [(1, 9, "A"), (10, 14, "B"), (15, 17, "C"), (20, 39, "D"), (40, 49, "E"), (50, 51, "F"),
                  (52, 59, "G"), (60, 67, "H"), (70, 89, "I"), (91, 99, "J")]
 
@@ -66,7 +67,7 @@ def peer_z(df: pd.DataFrame, cols: list[str] = FEATURES_USED, min_peers: int = M
     df.loc[counts < min_peers, "peer_group"] = df.size_q.astype(str) + "/all"
     df.loc[(counts < min_peers) & (q_counts < min_peers), "peer_group"] = "all"
     for c in cols:
-        df[f"z_{c}"] = df.groupby("peer_group")[c].transform(robust_z)
+        df[f"z_{c}"] = df.groupby("peer_group")[c].transform(robust_z).clip(-Z_CAP, Z_CAP)
     return df
 
 
@@ -125,10 +126,12 @@ def evaluate(df: pd.DataFrame, y: pd.Series, scores: dict[str, pd.Series]) -> pd
     return pd.DataFrame(rows)
 
 
-def load(features_db: str, releases_db: str, years=DEV_YEARS) -> pd.DataFrame:
+def load(features_db: str, releases_db: str, years=DEV_YEARS, edgar_db: str = EDGAR) -> pd.DataFrame:
     con = duckdb.connect(features_db, read_only=True)
-    df = con.execute("""SELECT * FROM features.targets WHERE in_universe
-                        AND year(day0) BETWEEN ? AND ?""", list(years)).df()
+    con.execute(f"ATTACH '{Path(edgar_db).as_posix()}' AS edgar (READ_ONLY)")
+    df = con.execute("""SELECT f.* FROM features.targets f JOIN edgar.events.target_audit a USING (event_id)
+                        WHERE f.in_universe AND a.in_target_set AND year(f.day0) BETWEEN ? AND ?""",
+                     list(years)).df()
     con.close()
     con = duckdb.connect(releases_db, read_only=True)
     lab = con.execute("SELECT event_id, is_charged FROM labels.charged_events").df()
@@ -152,15 +155,21 @@ def dev(features_db: str = FEATURES, releases_db: str = RELEASES, out: str = "re
     _, ev_placebo = results["placebo"]
     by_year = pre.assign(year=pd.to_datetime(pre.day0).dt.year).groupby("year").agg(
         events=("event_id", "size"), charged=("is_charged", "sum"))
+    pre = pre.assign(day0=pd.to_datetime(pre.day0).dt.date,
+                     rank=pre.composite.rank(ascending=False, method="min").astype("Int64"))
+    zcols = [f"z_{c}" for c in FEATURES_USED]
     top = pre.sort_values("composite", ascending=False).head(15)[
-        ["ticker", "day0", "is_charged", "composite"] + [f"z_{c}" for c in FEATURES_USED]].round(2)
+        ["ticker", "day0", "is_charged", "composite"] + zcols].round(2)
+    charged = pre[pre.is_charged].sort_values("composite", ascending=False)[
+        ["ticker", "day0", "rank", "composite"] + zcols + ["car", "abn_volume"]].round(2)
     text = "\n".join([
         f"# Development scores, acquisition targets {DEV_YEARS[0]}-{DEV_YEARS[1]}", "",
         "Pre-event window (-20 to -1):", "", ev_pre.to_markdown(index=False), "",
         "Placebo window (-70 to -51), H5 expects top-5% lift at or below 1.5:", "",
         ev_placebo.to_markdown(index=False), "",
         "Events and charged events per year:", "", by_year.to_markdown(), "",
-        "Top 15 by composite:", "", top.to_markdown(index=False), ""])
+        "Top 15 by composite:", "", top.to_markdown(index=False), "",
+        f"Charged events, by composite rank (of {len(pre)}):", "", charged.to_markdown(index=False), ""])
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     Path(out).write_text(text, encoding="utf-8")
     print(text)

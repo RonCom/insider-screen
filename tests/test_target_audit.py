@@ -49,3 +49,11 @@ def test_audit_table_and_test_symbols(tmp_path):
     con.close()
     out = tk.build(db)
     assert list(out.ticker) == ["CSH"]
+
+
+def test_spac_by_former_name():
+    import re
+    rx = re.compile(target_audit.SPAC_NAME_RE)
+    assert rx.search("Fisker Inc.|Spartan Energy Acquisition Corp.")
+    assert rx.search("OPES ACQUISITION CORP.") and rx.search("Tiberius Acquisition Corporation")
+    assert not rx.search("King Merger Sub II LLC") and not rx.search("Aircastle LTD")

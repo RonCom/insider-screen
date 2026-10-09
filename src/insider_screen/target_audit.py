@@ -5,7 +5,9 @@ PREM14A, DEFM14A, SC 14D9, SC14D9C or SC 13E3. Merger proxies are also filed by 
 shares (Ribbon buying ECI), by SPACs for their business combination (Clover Leaf), and by companies
 selling a major asset (Seres selling VOWST). Each target event is put in one category:
 
-  spac            SIC 6770 (blank check): a SPAC buys, it isn't bought
+  spac            SIC 6770 (blank check), or a current or former EDGAR name, or the day-0 ticker's name in
+                  the map, like "... Acquisition Corp": a SPAC buys, it isn't bought. EDGAR shows the SIC of
+                  the company after its business combination (Fisker, once Spartan Energy Acquisition Corp.)
   tender_or_13e3  the filer also filed SC 14D9 or SC 13E3 (only targets and going-private issuers do)
   delisted_after  the filer has a 25-NSE or 15-12B within DELIST_DAYS after day 0: it stopped trading
   unconfirmed     none of these: an acquirer, an asset seller, or a deal that broke
@@ -30,6 +32,8 @@ import pandas as pd
 
 from insider_screen.db import EDGAR, FINRA, REFERENCE
 
+SPAC_NAME_RE = (r"(?i)\bacquisition\s+(?:corp|corporation|company|co|inc|ltd|limited|holdings)\b"
+                r"|\bacquisitions?\s+corp\b|\bblank check\b")
 DELIST_DAYS = 730  # 540 missed ANSYS: Synopsys deal signed January 2024, closed July 2025
 TARGET_ONLY_FORMS = ("SC 14D9", "SC 13E3")
 EXIT_FORMS = ("25-NSE", "15-12B")
@@ -45,7 +49,7 @@ def audit(edgar_db: str = EDGAR, reference_db: str = REFERENCE, finra_db: str = 
         WITH t AS (SELECT * FROM ({tickers.event_tickers_sql(con)}) WHERE event_type = 'acquisition_target'),
         f AS (SELECT cik, form, filing_date FROM edgar.raw.edgar_filings
               WHERE form IN {TARGET_ONLY_FORMS + EXIT_FORMS})
-        SELECT t.event_id, t.cik, c.name AS company, c.sic, CAST(t.day0 AS DATE) AS day0, t.evidence,
+        SELECT t.event_id, t.cik, c.name AS company, c.sic, {tickers._names_sql(con)} AS all_names, CAST(t.day0 AS DATE) AS day0, t.evidence,
                t.ticker, t.ticker_source, m.type AS ticker_type, m.name AS ticker_name,
                EXISTS (SELECT 1 FROM f WHERE f.cik = t.cik AND f.form IN {TARGET_ONLY_FORMS}
                        AND f.filing_date BETWEEN CAST(t.day0 AS DATE) - 30 AND CAST(t.day0 AS DATE) + 365)
@@ -62,7 +66,8 @@ def audit(edgar_db: str = EDGAR, reference_db: str = REFERENCE, finra_db: str = 
     df["category"] = "unconfirmed"
     df.loc[df.exit_date.notna(), "category"] = "delisted_after"
     df.loc[df.tender_or_13e3, "category"] = "tender_or_13e3"
-    df.loc[df.sic.astype(str) == "6770", "category"] = "spac"
+    names = df.all_names.fillna("") + "|" + df.ticker_name.fillna("")
+    df.loc[(df.sic.astype(str) == "6770") | names.str.contains(SPAC_NAME_RE), "category"] = "spac"
     df["year"] = pd.to_datetime(df.day0).dt.year
     df["in_target_set"] = df.category.isin(["tender_or_13e3", "delisted_after"])
     Path(out).parent.mkdir(parents=True, exist_ok=True)
