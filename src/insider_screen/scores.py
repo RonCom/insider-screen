@@ -41,6 +41,9 @@ from insider_screen.db import EDGAR, FEATURES, RELEASES
 
 DEV_YEARS = (2017, 2020)
 TEST_YEARS = (2021, 2025)
+# thin share classes chosen when a sibling class of the same company trades far more
+# (scripts/share_class_check.py: Discovery's DISCB, whose DISCA and DISCK lack a CIK in the map; the only case)
+THIN_SHARE_CLASSES = ("DISCB",)
 BUDGET_PER_MONTH = 50  # H6
 TEST_REPORT = "reports/test_scores.md"
 FEATURES_USED = ["abn_volume", "last5_share", "scar", "short_share_z"]
@@ -171,6 +174,7 @@ def load(features_db: str, releases_db: str, years=DEV_YEARS, edgar_db: str = ED
         sql = """SELECT * FROM features.earnings WHERE in_universe AND year(day0) BETWEEN ? AND ?"""
     df = con.execute(sql, list(years)).df()
     con.close()
+    df = df[~df.ticker.isin(THIN_SHARE_CLASSES)]
     con = duckdb.connect(releases_db, read_only=True)
     lab = con.execute("SELECT event_id, is_charged FROM labels.charged_events").df()
     con.close()
